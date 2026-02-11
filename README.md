@@ -1,182 +1,118 @@
-# 📌 Battleship Job Search Platform
+# OperationBattleship Monorepo
 
-**Battleship** is an extensible, modular microservices platform for advanced job search, recommendation, and personalized career discovery. This system enables secure API-driven search, semantic resume matching, job classification, intelligent alerts, and a modern UI — all with a scalable architecture designed for real-world production.
+OperationBattleship is a Python microservices job-search platform scaffold using FastAPI, `uv`, Docker Compose, and Terraform.
 
-This repository contains the starter framework for Battleship, structured for growth, reproducibility, testability, and continuous delivery.
+## Repository structure
 
----
-
-## 🚀 Vision
-
-Battleship aims to:
-
-- **Match job seekers with relevant job opportunities** using advanced ML and semantic search.
-- Enable **microservices architecture** for independent scaling, testing, and deployment.
-- Support **personalized job alerts and analytics.**
-- Provide a **developer-friendly foundation**, extensible for AI-driven job insights.
-- Offer a **modern UI** with clean APIs and scalable backend services.
-
----
-
-## 🧠 Architectural Overview
-
-Battleship is composed of several core components:
-
-| Module | Responsibility |
-|--------|----------------|
-| `services/recommender/` | FastAPI-based recommendation API |
-| `services/frontend/` | Frontend application (React/Next.js or FastAPI UI shell) |
-| `services/emailer/` | Email alert engine and cron workers |
-| `libs/common/` | Shared utilities and models |
-| `ml/` | Training pipelines and model artifacts |
-| `infra/` | Infrastructure as code (K8s/Cloud/Terraform) |
-| `docker-compose.yml` | Local development orchestrator |
-| `Makefile` | Helpers for build and automation |
-
----
-
-## 📦 Getting Started
-
-### ❗ Prerequisites
-
-Install the following before you begin:
-
-```bash
-# System level
-Docker + Docker Compose
-Python 3.10+
-Node.js 18+ (if using React/Next.js)
-🛠 Local Development
-Clone the Repository
-git clone https://github.com/yourorg/battleship.git
-cd battleship
-🧱 Project Tree
-battleship/
-│
+```text
+.
+├── .github/workflows/
+│   ├── ci.yml
+│   └── release.yml
+├── infra/
+│   ├── environments/
+│   │   ├── dev/
+│   │   └── prod/
+│   ├── modules/
+│   │   ├── ecs/
+│   │   ├── iam/
+│   │   ├── rds/
+│   │   ├── s3/
+│   │   └── vpc/
+│   └── README.md
+├── libs/
+│   └── common/
+│       ├── pyproject.toml
+│       └── src/common/
 ├── services/
 │   ├── recommender/
 │   ├── frontend/
 │   └── emailer/
-│
-├── libs/
-│   └── common/
-│
-├── ml/
-│   ├── topic_modeling/
-│   └── classifier/
-│
-├── infra/
-│   ├── k8s/
-│   └── terraform/
-│
 ├── docker-compose.yml
 ├── Makefile
-├── .gitignore
-└── README.md
-⚙️ Configuration
-Configuration for services should be stored in environment files:
+└── pyproject.toml
+```
 
-cp .env.example .env
-Update the .env file with:
+## Services
 
-API keys
+- `recommender`: FastAPI recommendation API
+  - `GET /health`
+  - `POST /recommend`
+- `frontend`: FastAPI gateway + simple UI
+  - `GET /`
+  - `POST /api/recommend`
+- `emailer`: FastAPI async worker trigger API
+  - `GET /health`
+  - `POST /cron/digest`
 
-Database URLs
+Each service exposes OpenAPI docs at `/docs` and OpenAPI schema at `/openapi.json`.
 
-Email credentials
+## Dependency management with uv
 
-ML model paths
+This repo uses a `uv` workspace rooted at `pyproject.toml`.
 
-Authentication secrets
+### Bootstrap
 
-🧠 Microservices Overview
-🟢 Recommender Service
-Path: services/recommender/
+```bash
+./scripts/bootstrap.sh
+```
 
-Responsible for matching job postings to resumes
+### Common commands
 
-Exposes clean JSON APIs using FastAPI
+```bash
+# Install workspace dependencies
+uv sync --all-packages --group dev
 
-Implements versioned API contracts
+# Refresh lockfile
+uv lock
 
-Start locally:
+# Lint and test
+uv run ruff check .
+uv run pytest
+```
 
-cd services/recommender
-pip install -r requirements.txt
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
-🎨 Frontend
-Path: services/frontend/
+## Run locally
 
-UI for applicants to search jobs and view recommendations
+```bash
+# Full stack via Docker
+make dev
 
-Optional: React or Next.js (server or static rendered)
+# Or run services directly with uv
+make run-recommender
+make run-frontend
+make run-emailer
+```
 
-Connects to recommender and emailer via REST APIs
+Local URLs:
 
-Start frontend:
+- Frontend UI: `http://localhost:8000`
+- Recommender docs: `http://localhost:8001/docs`
+- Emailer docs: `http://localhost:8002/docs`
 
-cd services/frontend
-npm install
-npm run dev
-📧 Email Engine
-Path: services/emailer/
+## Terraform IaC
 
-Sends job alerts
+Terraform templates are under `infra/` with reusable modules and `dev`/`prod` environments.
 
-Scheduled via cron or worker queues
+```bash
+make tf-init-dev
+make tf-plan-dev
+# make tf-apply-dev
+```
 
-Uses shared common utilities
+Modules provision baseline AWS components:
 
-cd services/emailer
-pip install -r requirements.txt
-python runner.py
-🧪 Testing
-Add automated tests under each service.
+- VPC + public/private subnets
+- ECS cluster + CloudWatch logs
+- RDS PostgreSQL
+- S3 bucket
+- IAM ECS task execution role
 
-Run unit + integration tests:
+## CI/CD workflows
 
-make test
-📈 Machine Learning Pipelines
-Place data science artifacts, training pipelines, and model checkpoints under:
+- `ci.yml`: sync deps, lint, test, and build Docker images
+- `release.yml`: build/push images and apply Terraform to selected environment
 
-ml/
-├── topic_modeling/
-├── classifier/
-└── exports/
-Write production transforms (no notebooks only) using scripts in:
+## Notes
 
-python -m ml.topic_modeling.train
-python -m ml.classifier.train
-Export models to a shared artifact registry (S3, GCS, or local volume).
-
-📦 Packaging Shared Libraries
-The libs/common/ directory should be installable as a Python package:
-
-pip install -e libs/common
-🧩 Deployment
-Docker Compose (Local)
-docker compose up --build
-Production Deployment
-Use Kubernetes, autoscaling, and CI/CD.
-
-🧑‍💻 Contributing
-We welcome contributions! Please follow these guidelines:
-
-Fork the repo
-
-Create feature branches (feature/my-enhancement)
-
-Open PRs with clear descriptions
-
-Write tests
-
-Ensure CI passes
-
-📄 Code of Conduct
-All contributors agree to the Contributor Covenant Code of Conduct.
-
-📜 License
-Battleship is released under the MIT License.
-
-❤️ Acknowledgments
-The idea and initial design concepts were inspired by existing job search systems and community research. Big thanks to Matthew Caraway!
+- Replace placeholder secrets in `infra/environments/*/terraform.tfvars` with secure secret management.
+- Extend service internals (queue provider, persistence, auth) as implementation proceeds.

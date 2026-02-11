@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  lint-test-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --all-packages --group dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        run: uv run pytest
+
+      - name: Build recommender image
+        run: docker build -f services/recommender/Dockerfile -t battleship/recommender:ci .
+
+      - name: Build frontend image
+        run: docker build -f services/frontend/Dockerfile -t battleship/frontend:ci .
+
+      - name: Build emailer image
+        run: docker build -f services/emailer/Dockerfile -t battleship/emailer:ci .

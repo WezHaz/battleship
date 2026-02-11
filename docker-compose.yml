@@ -1,0 +1,48 @@
+services:
+  recommender:
+    build:
+      context: .
+      dockerfile: services/recommender/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://battleship:battleship@postgres:5432/battleship}
+    depends_on:
+      - postgres
+    ports:
+      - "8001:8001"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: services/frontend/Dockerfile
+    environment:
+      RECOMMENDER_BASE_URL: ${RECOMMENDER_BASE_URL:-http://recommender:8001}
+    depends_on:
+      - recommender
+    ports:
+      - "8000:8000"
+
+  emailer:
+    build:
+      context: .
+      dockerfile: services/emailer/Dockerfile
+    environment:
+      RECOMMENDER_BASE_URL: ${RECOMMENDER_BASE_URL:-http://recommender:8001}
+      DIGEST_FROM_EMAIL: ${DIGEST_FROM_EMAIL:-noreply@operationbattleship.local}
+    depends_on:
+      - recommender
+    ports:
+      - "8002:8002"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: battleship
+      POSTGRES_USER: battleship
+      POSTGRES_PASSWORD: battleship
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:
