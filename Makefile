@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: init lock sync lint test dev down \
+.PHONY: init lock sync lint test test-unit test-integration test-bdd dev down \
 	 run-recommender run-frontend run-emailer \
 	 tf-init-dev tf-plan-dev tf-apply-dev \
 	 tf-init-prod tf-plan-prod tf-apply-prod
@@ -19,6 +19,15 @@ lint:
 
 test:
 	uv run pytest
+
+test-unit:
+	uv run pytest -m unit
+
+test-integration:
+	uv run pytest -m integration
+
+test-bdd:
+	uv run pytest -m bdd
 
 dev:
 	docker compose up --build

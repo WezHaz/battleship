@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from contextlib import asynccontextmanager
 
 from common.utils import now_utc_iso
 from fastapi import FastAPI
@@ -9,28 +10,26 @@ from pydantic import BaseModel, EmailStr, Field
 
 from emailer.worker import DigestJob, DigestWorker
 
-app = FastAPI(title="OperationBattleship Emailer", version="0.1.0")
 worker = DigestWorker()
-worker_task: asyncio.Task | None = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    worker_task = asyncio.create_task(worker.run())
+    try:
+        yield
+    finally:
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+app = FastAPI(title="OperationBattleship Emailer", version="0.1.0", lifespan=lifespan)
 
 
 class DigestRequest(BaseModel):
     recipients: list[EmailStr] = Field(default_factory=list)
     jobs: list[str] = Field(default_factory=list)
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    global worker_task
-    worker_task = asyncio.create_task(worker.run())
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    if worker_task:
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
 
 
 @app.get("/health")

@@ -71,6 +71,32 @@ uv run ruff check .
 uv run pytest
 ```
 
+## Testing Strategy (pytest + pytest-bdd)
+
+The repository uses a single `pytest` runner across three test layers:
+
+- `unit`: fast, isolated tests for pure helpers and local classes
+- `integration`: API-level tests with FastAPI `TestClient`
+- `bdd`: behavior specs in `.feature` files that double as executable usage examples
+
+BDD feature files live under `tests/bdd/features/`, and step definitions live in `tests/bdd/test_*.py`.
+
+### Run specific suites
+
+```bash
+# All tests
+uv run pytest
+
+# Only unit tests
+uv run pytest -m unit
+
+# Only integration tests
+uv run pytest -m integration
+
+# Only BDD scenarios
+uv run pytest -m bdd
+```
+
 ## Run locally
 
 ```bash
