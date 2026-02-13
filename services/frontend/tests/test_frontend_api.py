@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import frontend.main as frontend_main
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -33,6 +34,19 @@ class StubAsyncClient:
         self.capture["url"] = url
         self.capture["json"] = json
         return self.response
+
+
+class ErroringAsyncClient:
+    async def __aenter__(self) -> ErroringAsyncClient:
+        return self
+
+    async def __aexit__(self, *_: object) -> bool:
+        return False
+
+    async def post(self, url: str, json: dict[str, Any]) -> StubResponse:
+        del json
+        request = httpx.Request("POST", url)
+        raise httpx.RequestError("connection failed", request=request)
 
 
 def test_health() -> None:
@@ -93,3 +107,25 @@ def test_proxy_recommend_maps_upstream_errors_to_502(monkeypatch: pytest.MonkeyP
 
     assert response.status_code == 502
     assert response.json() == {"detail": "Upstream recommender request failed"}
+
+
+def test_proxy_recommend_maps_upstream_connectivity_errors_to_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        frontend_main.httpx,
+        "AsyncClient",
+        lambda *_, **__: ErroringAsyncClient(),
+    )
+
+    with TestClient(frontend_main.app) as client:
+        response = client.post(
+            "/api/recommend",
+            json={
+                "resume_text": "Experienced backend python engineer building API services.",
+                "postings": ["Backend Engineer"],
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Upstream recommender is unavailable"}

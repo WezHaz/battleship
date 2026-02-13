@@ -82,8 +82,11 @@ async def proxy_recommend(payload: UIRecommendRequest) -> dict:
         ],
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.post(f"{RECOMMENDER_BASE_URL}/recommend", json=recommender_payload)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(f"{RECOMMENDER_BASE_URL}/recommend", json=recommender_payload)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail="Upstream recommender is unavailable") from exc
 
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail="Upstream recommender request failed")
