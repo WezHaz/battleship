@@ -87,6 +87,9 @@ BDD feature files live under `tests/bdd/features/`, and step definitions live in
 # All tests
 uv run pytest
 
+# Minimal readiness harness
+uv run pytest -m smoke
+
 # Only unit tests
 uv run pytest -m unit
 
