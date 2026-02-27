@@ -94,10 +94,11 @@ class RecommendRequest(BaseModel):
     resume_text: str = Field(..., min_length=20)
     postings: list[JobPosting] = Field(default_factory=list)
     max_postings: int = Field(default=100, ge=1, le=500)
+    profile_id: str | None = None
     preferred_keywords: list[str] = Field(default_factory=list)
     preferred_locations: list[str] = Field(default_factory=list)
     preferred_companies: list[str] = Field(default_factory=list)
-    remote_only: bool = False
+    remote_only: bool | None = None
 
 
 class ScoreBreakdown(BaseModel):
@@ -124,6 +125,7 @@ class RankedRecommendation(BaseModel):
 class RecommendResponse(BaseModel):
     run_id: int
     source: Literal["payload", "stored"]
+    applied_profile_id: str | None = None
     generated_at: str
     recommendations: list[RankedRecommendation]
 
@@ -158,6 +160,45 @@ class RecommendationRun(BaseModel):
 
 class RecommendationHistoryResponse(BaseModel):
     runs: list[RecommendationRun]
+
+
+class UserProfileUpsertRequest(BaseModel):
+    profile_id: str = Field(..., min_length=3, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    name: str = Field(..., min_length=1, max_length=120)
+    preferred_keywords: list[str] = Field(default_factory=list)
+    preferred_locations: list[str] = Field(default_factory=list)
+    preferred_companies: list[str] = Field(default_factory=list)
+    remote_only: bool = False
+
+    def config_json(self) -> str:
+        preferred_keywords = [
+            normalize_whitespace(value) for value in self.preferred_keywords if value.strip()
+        ]
+        preferred_locations = [
+            normalize_whitespace(value) for value in self.preferred_locations if value.strip()
+        ]
+        preferred_companies = [
+            normalize_whitespace(value) for value in self.preferred_companies if value.strip()
+        ]
+        return json.dumps(
+            {
+                "preferred_keywords": preferred_keywords,
+                "preferred_locations": preferred_locations,
+                "preferred_companies": preferred_companies,
+                "remote_only": self.remote_only,
+            }
+        )
+
+
+class UserPreferenceProfile(BaseModel):
+    profile_id: str
+    name: str
+    preferred_keywords: list[str]
+    preferred_locations: list[str]
+    preferred_companies: list[str]
+    remote_only: bool
+    created_at: str
+    updated_at: str
 
 
 class IngestedPosting(BaseModel):
@@ -296,6 +337,14 @@ class RecommenderRepository:
                     last_scan_at TEXT,
                     last_status TEXT,
                     last_error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -618,6 +667,85 @@ class RecommenderRepository:
                 )
             return [self._to_job_source(row) for row in cursor.fetchall()]
 
+    def upsert_user_profile(self, payload: UserProfileUpsertRequest) -> UserPreferenceProfile:
+        with self._lock:
+            now = now_utc_iso()
+            self.connection.execute(
+                """
+                INSERT INTO user_profiles (
+                    profile_id,
+                    name,
+                    config_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id) DO UPDATE SET
+                    name = excluded.name,
+                    config_json = excluded.config_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    payload.profile_id,
+                    payload.name,
+                    payload.config_json(),
+                    now,
+                    now,
+                ),
+            )
+            self.connection.commit()
+            return self.get_user_profile_or_raise(payload.profile_id)
+
+    def get_user_profile_or_raise(self, profile_id: str) -> UserPreferenceProfile:
+        profile = self.get_user_profile(profile_id)
+        if profile is None:
+            raise KeyError(f"Unknown profile_id: {profile_id}")
+        return profile
+
+    def get_user_profile(self, profile_id: str) -> UserPreferenceProfile | None:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT
+                    profile_id,
+                    name,
+                    config_json,
+                    created_at,
+                    updated_at
+                FROM user_profiles
+                WHERE profile_id = ?
+                """,
+                (profile_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._to_user_profile(row)
+
+    def list_user_profiles(self) -> list[UserPreferenceProfile]:
+        with self._lock:
+            cursor = self.connection.execute(
+                """
+                SELECT
+                    profile_id,
+                    name,
+                    config_json,
+                    created_at,
+                    updated_at
+                FROM user_profiles
+                ORDER BY profile_id
+                """
+            )
+            return [self._to_user_profile(row) for row in cursor.fetchall()]
+
+    def delete_user_profile(self, profile_id: str) -> bool:
+        with self._lock:
+            cursor = self.connection.execute(
+                "DELETE FROM user_profiles WHERE profile_id = ?",
+                (profile_id,),
+            )
+            self.connection.commit()
+            return cursor.rowcount > 0
+
     def update_job_source_scan_state(
         self,
         source_id: str,
@@ -654,6 +782,19 @@ class RecommenderRepository:
             last_status=row["last_status"],
             last_error=row["last_error"],
             config=config,
+        )
+
+    def _to_user_profile(self, row: sqlite3.Row) -> UserPreferenceProfile:
+        config: dict[str, Any] = json.loads(row["config_json"])
+        return UserPreferenceProfile(
+            profile_id=row["profile_id"],
+            name=row["name"],
+            preferred_keywords=config.get("preferred_keywords", []),
+            preferred_locations=config.get("preferred_locations", []),
+            preferred_companies=config.get("preferred_companies", []),
+            remote_only=bool(config.get("remote_only", False)),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
 
@@ -757,6 +898,22 @@ def rank_postings(
 
     ranked.sort(key=lambda item: item.score, reverse=True)
     return ranked
+
+
+def resolve_recommendation_preferences(
+    payload: RecommendRequest,
+    profile: UserPreferenceProfile | None,
+) -> tuple[list[str], list[str], list[str], bool]:
+    profile_keywords = profile.preferred_keywords if profile else []
+    profile_locations = profile.preferred_locations if profile else []
+    profile_companies = profile.preferred_companies if profile else []
+    profile_remote_only = profile.remote_only if profile else False
+
+    preferred_keywords = payload.preferred_keywords or profile_keywords
+    preferred_locations = payload.preferred_locations or profile_locations
+    preferred_companies = payload.preferred_companies or profile_companies
+    remote_only = payload.remote_only if payload.remote_only is not None else profile_remote_only
+    return preferred_keywords, preferred_locations, preferred_companies, remote_only
 
 
 def to_job_postings_from_payload(
@@ -993,6 +1150,36 @@ def create_app(
             results=results,
         )
 
+    @app.post("/profiles", response_model=UserPreferenceProfile)
+    async def upsert_profile(
+        payload: UserProfileUpsertRequest,
+        request: Request,
+    ) -> UserPreferenceProfile:
+        require_api_key(request)
+        return await run_in_threadpool(request.app.state.repository.upsert_user_profile, payload)
+
+    @app.get("/profiles", response_model=list[UserPreferenceProfile])
+    async def list_profiles(request: Request) -> list[UserPreferenceProfile]:
+        return await run_in_threadpool(request.app.state.repository.list_user_profiles)
+
+    @app.get("/profiles/{profile_id}", response_model=UserPreferenceProfile)
+    async def get_profile(profile_id: str, request: Request) -> UserPreferenceProfile:
+        profile = await run_in_threadpool(request.app.state.repository.get_user_profile, profile_id)
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Unknown profile_id")
+        return profile
+
+    @app.delete("/profiles/{profile_id}")
+    async def delete_profile(profile_id: str, request: Request) -> dict[str, bool]:
+        require_api_key(request)
+        deleted = await run_in_threadpool(
+            request.app.state.repository.delete_user_profile,
+            profile_id,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Unknown profile_id")
+        return {"deleted": True}
+
     @app.get("/recommendations/history", response_model=RecommendationHistoryResponse)
     async def recommendation_history(
         request: Request,
@@ -1004,6 +1191,15 @@ def create_app(
     @app.post("/recommend", response_model=RecommendResponse)
     async def recommend(payload: RecommendRequest, request: Request) -> RecommendResponse:
         source: Literal["payload", "stored"] = "payload"
+        profile: UserPreferenceProfile | None = None
+        if payload.profile_id:
+            profile = await run_in_threadpool(
+                request.app.state.repository.get_user_profile,
+                payload.profile_id,
+            )
+            if profile is None:
+                raise HTTPException(status_code=404, detail="Unknown profile_id")
+
         postings = payload.postings
         if not postings:
             source = "stored"
@@ -1030,13 +1226,17 @@ def create_app(
         else:
             await run_in_threadpool(request.app.state.repository.upsert_postings, postings)
 
+        preferred_keywords, preferred_locations, preferred_companies, remote_only = (
+            resolve_recommendation_preferences(payload, profile)
+        )
+
         ranked = rank_postings(
             payload.resume_text,
             postings,
-            preferred_keywords=payload.preferred_keywords,
-            preferred_locations=payload.preferred_locations,
-            preferred_companies=payload.preferred_companies,
-            remote_only=payload.remote_only,
+            preferred_keywords=preferred_keywords,
+            preferred_locations=preferred_locations,
+            preferred_companies=preferred_companies,
+            remote_only=remote_only,
         )
         run_id, generated_at = await run_in_threadpool(
             request.app.state.repository.record_recommendations,
@@ -1046,6 +1246,7 @@ def create_app(
         return RecommendResponse(
             run_id=run_id,
             source=source,
+            applied_profile_id=profile.profile_id if profile else None,
             generated_at=generated_at,
             recommendations=ranked,
         )

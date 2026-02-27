@@ -43,6 +43,10 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /job-sources`
   - `POST /job-sources/{source_id}/scan`
   - `POST /job-sources/scan`
+  - `POST /profiles`
+  - `GET /profiles`
+  - `GET /profiles/{profile_id}`
+  - `DELETE /profiles/{profile_id}`
   - `POST /recommend`
   - `GET /recommendations/history`
 - `frontend`: FastAPI gateway + simple UI
@@ -197,6 +201,7 @@ When a source scan runs:
 ## Recommendation personalization
 
 `POST /recommend` accepts optional preference fields:
+- `profile_id` (loads a saved preference profile)
 - `preferred_keywords`
 - `preferred_locations`
 - `preferred_companies`
@@ -205,6 +210,32 @@ When a source scan runs:
 Response recommendations now include:
 - `matched_terms`
 - `score_breakdown` (title/description overlap, preference bonus, freshness bonus, duplicate penalty)
+- `applied_profile_id`
+
+### Saved user preference profiles
+
+```bash
+# Create or update a profile
+curl -X POST http://localhost:8001/profiles \
+  -H "Content-Type: application/json" \
+  -d '{
+    "profile_id":"wesley_remote",
+    "name":"Wesley Remote",
+    "preferred_keywords":["python","api","backend"],
+    "preferred_locations":["Remote"],
+    "preferred_companies":["Acme Labs"],
+    "remote_only":true
+  }'
+
+# Use saved profile in recommendation requests
+curl -X POST http://localhost:8001/recommend \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resume_text":"Backend engineer building Python API services",
+    "profile_id":"wesley_remote",
+    "postings":[]
+  }'
+```
 
 ## Security hardening (current)
 
@@ -213,6 +244,8 @@ Set `RECOMMENDER_API_KEY` to protect write endpoints:
 - `POST /job-sources`
 - `POST /job-sources/{source_id}/scan`
 - `POST /job-sources/scan`
+- `POST /profiles`
+- `DELETE /profiles/{profile_id}`
 
 When enabled, send the key in `x-api-key`.  
 The frontend forwards this header automatically when `RECOMMENDER_API_KEY` is configured for the frontend service too.
