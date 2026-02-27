@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
 import tempfile
 import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,8 +18,9 @@ from urllib import request as urllib_request
 from urllib.parse import urlsplit
 
 from common.utils import now_utc_iso, tokenize
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 DEFAULT_DB_PATH = os.path.join(tempfile.gettempdir(), "operation-battleship", "recommender.sqlite3")
@@ -24,6 +28,7 @@ DEFAULT_DB_PATH = os.path.join(tempfile.gettempdir(), "operation-battleship", "r
 SOURCE_INLINE_JSON = "inline_json"
 SOURCE_JSON_URL = "json_url"
 SOURCE_TYPES = (SOURCE_INLINE_JSON, SOURCE_JSON_URL)
+LOGGER = logging.getLogger("battleship.recommender")
 
 
 def normalize_whitespace(text: str) -> str:
@@ -302,6 +307,7 @@ class UpsertSummary(BaseModel):
 
 class AuditEvent(BaseModel):
     event_id: int
+    request_id: str | None = None
     occurred_at: str
     method: str
     path: str
@@ -312,6 +318,53 @@ class AuditEvent(BaseModel):
     auth_subject: str | None = None
     status: str
     message: str | None = None
+
+
+class MetricsSnapshot(BaseModel):
+    generated_at: str
+    totals: dict[str, int]
+    endpoints: dict[str, dict[str, float | int]]
+
+
+class MetricsStore:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._totals = {"requests": 0, "errors": 0}
+        self._endpoints: dict[str, dict[str, float | int]] = {}
+
+    def observe(self, *, method: str, path: str, status_code: int, duration_ms: float) -> None:
+        key = f"{method} {path}"
+        bucket = f"{status_code // 100}xx"
+        with self._lock:
+            self._totals["requests"] += 1
+            if status_code >= 400:
+                self._totals["errors"] += 1
+            endpoint = self._endpoints.setdefault(
+                key,
+                {
+                    "count": 0,
+                    "2xx": 0,
+                    "4xx": 0,
+                    "5xx": 0,
+                    "latency_ms_sum": 0.0,
+                    "latency_ms_avg": 0.0,
+                },
+            )
+            endpoint["count"] = int(endpoint["count"]) + 1
+            if bucket in ("2xx", "4xx", "5xx"):
+                endpoint[bucket] = int(endpoint[bucket]) + 1
+            endpoint["latency_ms_sum"] = float(endpoint["latency_ms_sum"]) + duration_ms
+            endpoint["latency_ms_avg"] = (
+                float(endpoint["latency_ms_sum"]) / int(endpoint["count"])
+            )
+
+    def snapshot(self) -> MetricsSnapshot:
+        with self._lock:
+            return MetricsSnapshot(
+                generated_at=now_utc_iso(),
+                totals=dict(self._totals),
+                endpoints={key: dict(value) for key, value in self._endpoints.items()},
+            )
 
 
 class RecommenderRepository:
@@ -392,6 +445,7 @@ class RecommenderRepository:
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     occurred_at TEXT NOT NULL,
+                    request_id TEXT,
                     method TEXT NOT NULL,
                     path TEXT NOT NULL,
                     action TEXT NOT NULL,
@@ -405,6 +459,7 @@ class RecommenderRepository:
                 """
             )
             self._ensure_job_postings_columns()
+            self._ensure_audit_events_columns()
             self._connection.commit()
 
     def _ensure_job_postings_columns(self) -> None:
@@ -430,6 +485,12 @@ class RecommenderRepository:
             self.connection.execute(
                 f"ALTER TABLE job_postings ADD COLUMN {column_name} {definition}"
             )
+
+    def _ensure_audit_events_columns(self) -> None:
+        column_rows = self.connection.execute("PRAGMA table_info(audit_events)").fetchall()
+        existing = {row["name"] for row in column_rows}
+        if "request_id" not in existing:
+            self.connection.execute("ALTER TABLE audit_events ADD COLUMN request_id TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -805,6 +866,7 @@ class RecommenderRepository:
     def record_audit_event(
         self,
         *,
+        request_id: str | None,
         method: str,
         path: str,
         action: str,
@@ -814,12 +876,13 @@ class RecommenderRepository:
         auth_subject: str | None,
         status: str,
         message: str | None,
-    ) -> None:
+    ) -> int:
         with self._lock:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 INSERT INTO audit_events (
                     occurred_at,
+                    request_id,
                     method,
                     path,
                     action,
@@ -830,10 +893,11 @@ class RecommenderRepository:
                     status,
                     message
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now_utc_iso(),
+                    request_id,
                     method,
                     path,
                     action,
@@ -846,6 +910,7 @@ class RecommenderRepository:
                 ),
             )
             self.connection.commit()
+            return int(cursor.lastrowid)
 
     def list_audit_events(
         self,
@@ -859,6 +924,7 @@ class RecommenderRepository:
                 SELECT
                     id AS event_id,
                     occurred_at,
+                    request_id,
                     method,
                     path,
                     action,
@@ -1215,6 +1281,7 @@ def create_app(
         await run_in_threadpool(repository.connect)
         app.state.repository = repository
         app.state.auth_token_scopes = resolved_token_map
+        app.state.metrics = MetricsStore()
         try:
             yield
         finally:
@@ -1230,11 +1297,13 @@ def create_app(
         status: str,
         message: str | None = None,
         auth_subject: str | None = None,
-    ) -> None:
+    ) -> int:
+        request_id = getattr(request.state, "request_id", None)
         source_ip = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
-        await run_in_threadpool(
+        return await run_in_threadpool(
             request.app.state.repository.record_audit_event,
+            request_id=request_id,
             method=request.method,
             path=request.url.path,
             action=action,
@@ -1245,6 +1314,64 @@ def create_app(
             status=status,
             message=message,
         )
+
+    @app.middleware("http")
+    async def observability_middleware(request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        started = time.perf_counter()
+
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - started) * 1000
+            request.app.state.metrics.observe(
+                method=request.method,
+                path=request.url.path,
+                status_code=500,
+                duration_ms=duration_ms,
+            )
+            LOGGER.exception(
+                json.dumps(
+                    {
+                        "event": "request_complete",
+                        "request_id": request_id,
+                        "method": request.method,
+                        "path": request.url.path,
+                        "status_code": 500,
+                        "duration_ms": round(duration_ms, 3),
+                        "error": str(exc),
+                    }
+                )
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Internal Server Error", "request_id": request_id},
+                headers={"x-request-id": request_id},
+            )
+
+        duration_ms = (time.perf_counter() - started) * 1000
+        request.app.state.metrics.observe(
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
+        response.headers["x-request-id"] = request_id
+        LOGGER.info(
+            json.dumps(
+                {
+                    "event": "request_complete",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": response.status_code,
+                    "duration_ms": round(duration_ms, 3),
+                    "source_ip": request.client.host if request.client else None,
+                }
+            )
+        )
+        return response
 
     async def require_scope(
         request: Request,
@@ -1284,10 +1411,15 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "recommender"}
 
+    @app.get("/metrics", response_model=MetricsSnapshot)
+    async def metrics(request: Request) -> MetricsSnapshot:
+        return request.app.state.metrics.snapshot()
+
     @app.post("/postings", response_model=UpsertPostingsResponse)
     async def upsert_postings(
         payload: UpsertPostingsRequest,
         request: Request,
+        response: Response,
     ) -> UpsertPostingsResponse:
         auth_subject = await require_scope(
             request,
@@ -1298,7 +1430,7 @@ def create_app(
             request.app.state.repository.upsert_postings,
             payload.postings,
         )
-        await write_audit_event(
+        event_id = await write_audit_event(
             request,
             action="postings_upsert",
             scope="postings:write",
@@ -1306,6 +1438,7 @@ def create_app(
             message=f"updated={updated}",
             auth_subject=auth_subject,
         )
+        response.headers["x-audit-event-id"] = str(event_id)
         return UpsertPostingsResponse(updated=updated)
 
     @app.get("/postings", response_model=list[StoredPosting])
@@ -1316,14 +1449,18 @@ def create_app(
         return await run_in_threadpool(request.app.state.repository.list_postings, limit)
 
     @app.post("/job-sources", response_model=JobSource)
-    async def upsert_job_source(payload: JobSourceUpsertRequest, request: Request) -> JobSource:
+    async def upsert_job_source(
+        payload: JobSourceUpsertRequest,
+        request: Request,
+        response: Response,
+    ) -> JobSource:
         auth_subject = await require_scope(
             request,
             action="job_source_upsert",
             scope="sources:write",
         )
         source = await run_in_threadpool(request.app.state.repository.upsert_job_source, payload)
-        await write_audit_event(
+        event_id = await write_audit_event(
             request,
             action="job_source_upsert",
             scope="sources:write",
@@ -1331,6 +1468,7 @@ def create_app(
             message=f"source_id={source.source_id}",
             auth_subject=auth_subject,
         )
+        response.headers["x-audit-event-id"] = str(event_id)
         return source
 
     @app.get("/job-sources", response_model=list[JobSource])
@@ -1341,7 +1479,11 @@ def create_app(
         return await run_in_threadpool(request.app.state.repository.list_job_sources, enabled_only)
 
     @app.post("/job-sources/{source_id}/scan", response_model=JobSourceScanResult)
-    async def scan_job_source(source_id: str, request: Request) -> JobSourceScanResult:
+    async def scan_job_source(
+        source_id: str,
+        request: Request,
+        response: Response,
+    ) -> JobSourceScanResult:
         auth_subject = await require_scope(
             request,
             action="job_source_scan_one",
@@ -1349,7 +1491,7 @@ def create_app(
         )
         source = await run_in_threadpool(request.app.state.repository.get_job_source, source_id)
         if source is None:
-            await write_audit_event(
+            event_id = await write_audit_event(
                 request,
                 action="job_source_scan_one",
                 scope="scan",
@@ -1357,11 +1499,12 @@ def create_app(
                 message=f"source_id={source_id}",
                 auth_subject=auth_subject,
             )
+            response.headers["x-audit-event-id"] = str(event_id)
             raise HTTPException(status_code=404, detail="Unknown source_id")
 
         result = await run_in_threadpool(scan_source, request.app.state.repository, source)
         if result.status == "error":
-            await write_audit_event(
+            event_id = await write_audit_event(
                 request,
                 action="job_source_scan_one",
                 scope="scan",
@@ -1369,11 +1512,12 @@ def create_app(
                 message=f"source_id={source_id}; error={result.error}",
                 auth_subject=auth_subject,
             )
+            response.headers["x-audit-event-id"] = str(event_id)
             raise HTTPException(
                 status_code=502,
                 detail={"source_id": result.source_id, "error": result.error},
             )
-        await write_audit_event(
+        event_id = await write_audit_event(
             request,
             action="job_source_scan_one",
             scope="scan",
@@ -1384,11 +1528,13 @@ def create_app(
             ),
             auth_subject=auth_subject,
         )
+        response.headers["x-audit-event-id"] = str(event_id)
         return result
 
     @app.post("/job-sources/scan", response_model=JobSourceScanBatchResponse)
     async def scan_job_sources(
         request: Request,
+        response: Response,
         enabled_only: bool = Query(default=True),
     ) -> JobSourceScanBatchResponse:
         auth_subject = await require_scope(
@@ -1414,7 +1560,7 @@ def create_app(
             possible_duplicates=sum(result.possible_duplicates for result in results),
             results=results,
         )
-        await write_audit_event(
+        event_id = await write_audit_event(
             request,
             action="job_source_scan_all",
             scope="scan",
@@ -1425,12 +1571,14 @@ def create_app(
             ),
             auth_subject=auth_subject,
         )
+        response.headers["x-audit-event-id"] = str(event_id)
         return batch
 
     @app.post("/profiles", response_model=UserPreferenceProfile)
     async def upsert_profile(
         payload: UserProfileUpsertRequest,
         request: Request,
+        response: Response,
     ) -> UserPreferenceProfile:
         auth_subject = await require_scope(
             request,
@@ -1438,7 +1586,7 @@ def create_app(
             scope="profiles:write",
         )
         profile = await run_in_threadpool(request.app.state.repository.upsert_user_profile, payload)
-        await write_audit_event(
+        event_id = await write_audit_event(
             request,
             action="profile_upsert",
             scope="profiles:write",
@@ -1446,6 +1594,7 @@ def create_app(
             message=f"profile_id={profile.profile_id}",
             auth_subject=auth_subject,
         )
+        response.headers["x-audit-event-id"] = str(event_id)
         return profile
 
     @app.get("/profiles", response_model=list[UserPreferenceProfile])
@@ -1460,7 +1609,11 @@ def create_app(
         return profile
 
     @app.delete("/profiles/{profile_id}")
-    async def delete_profile(profile_id: str, request: Request) -> dict[str, bool]:
+    async def delete_profile(
+        profile_id: str,
+        request: Request,
+        response: Response,
+    ) -> dict[str, bool]:
         auth_subject = await require_scope(
             request,
             action="profile_delete",
@@ -1471,7 +1624,7 @@ def create_app(
             profile_id,
         )
         if not deleted:
-            await write_audit_event(
+            event_id = await write_audit_event(
                 request,
                 action="profile_delete",
                 scope="profiles:write",
@@ -1479,8 +1632,9 @@ def create_app(
                 message=f"profile_id={profile_id}",
                 auth_subject=auth_subject,
             )
+            response.headers["x-audit-event-id"] = str(event_id)
             raise HTTPException(status_code=404, detail="Unknown profile_id")
-        await write_audit_event(
+        event_id = await write_audit_event(
             request,
             action="profile_delete",
             scope="profiles:write",
@@ -1488,11 +1642,13 @@ def create_app(
             message=f"profile_id={profile_id}",
             auth_subject=auth_subject,
         )
+        response.headers["x-audit-event-id"] = str(event_id)
         return {"deleted": True}
 
     @app.get("/audit-events", response_model=list[AuditEvent])
     async def list_audit_events(
         request: Request,
+        response: Response,
         limit: int = Query(default=100, ge=1, le=500),
         action: str | None = None,
         status: str | None = None,
@@ -1508,7 +1664,7 @@ def create_app(
             action=action,
             status=status,
         )
-        await write_audit_event(
+        event_id = await write_audit_event(
             request,
             action="audit_events_list",
             scope="audit:read",
@@ -1516,6 +1672,7 @@ def create_app(
             message=f"returned={len(events)}",
             auth_subject=auth_subject,
         )
+        response.headers["x-audit-event-id"] = str(event_id)
         return events
 
     @app.get("/recommendations/history", response_model=RecommendationHistoryResponse)

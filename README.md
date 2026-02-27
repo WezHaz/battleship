@@ -48,6 +48,7 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /profiles/{profile_id}`
   - `DELETE /profiles/{profile_id}`
   - `GET /audit-events`
+  - `GET /metrics`
   - `POST /recommend`
   - `GET /recommendations/history`
 - `frontend`: FastAPI gateway + simple UI
@@ -275,11 +276,20 @@ Scope usage:
 
 Audit events are recorded for protected actions with:
 - endpoint method/path
+- request ID
 - action name
 - required scope
 - source IP/user agent
 - auth subject fingerprint
 - status (`ok`, `unauthorized`, `forbidden`, `not_found`, `error`)
+
+## Observability baseline
+
+The recommender now emits baseline observability signals for both humans and AI agents:
+- every response includes `x-request-id` (client value preserved if supplied)
+- protected write/read actions include `x-audit-event-id`
+- structured JSON request completion logs are emitted (method/path/status/duration)
+- `GET /metrics` returns JSON counters and latency aggregates by endpoint
 
 ## Terraform IaC
 

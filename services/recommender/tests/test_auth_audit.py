@@ -49,6 +49,7 @@ def test_scope_enforcement_for_write_endpoints(client: TestClient) -> None:
     )
     assert allowed.status_code == 200
     assert allowed.json() == {"updated": 1}
+    assert allowed.headers.get("x-audit-event-id")
 
 
 def test_audit_events_capture_status_and_action(client: TestClient) -> None:
@@ -91,8 +92,10 @@ def test_audit_events_capture_status_and_action(client: TestClient) -> None:
     )
     assert events_response.status_code == 200
     events = events_response.json()
+    assert events_response.headers.get("x-audit-event-id")
     statuses = {event["status"] for event in events}
     actions = {event["action"] for event in events}
+    assert any(event.get("request_id") for event in events)
     assert "unauthorized" in statuses
     assert "forbidden" in statuses
     assert "ok" in statuses
