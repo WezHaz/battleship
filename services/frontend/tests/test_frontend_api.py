@@ -11,9 +11,15 @@ pytestmark = pytest.mark.integration
 
 
 class StubResponse:
-    def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self) -> dict[str, Any]:
         return self._payload
@@ -30,12 +36,14 @@ class StubAsyncClient:
     async def __aexit__(self, *_: object) -> bool:
         return False
 
-    async def post(
+    async def request(
         self,
+        method: str,
         url: str,
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> StubResponse:
+        self.capture["method"] = method
         self.capture["url"] = url
         self.capture["json"] = json
         self.capture["headers"] = headers or {}
@@ -49,13 +57,14 @@ class ErroringAsyncClient:
     async def __aexit__(self, *_: object) -> bool:
         return False
 
-    async def post(
+    async def request(
         self,
+        method: str,
         url: str,
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> StubResponse:
-        del json, headers
+        del method, json, headers
         request = httpx.Request("POST", url)
         raise httpx.RequestError("connection failed", request=request)
 
@@ -74,7 +83,11 @@ def test_proxy_recommend_wraps_upstream_payload(monkeypatch: pytest.MonkeyPatch)
         "generated_at": "2026-02-11T10:00:00+00:00",
         "recommendations": [{"id": "job-1", "title": "Backend Engineer", "score": 0.75}],
     }
-    response = StubResponse(status_code=200, payload=upstream_payload)
+    response = StubResponse(
+        status_code=200,
+        payload=upstream_payload,
+        headers={"x-request-id": "req-123", "x-audit-event-id": "71"},
+    )
     monkeypatch.setattr(
         frontend_main.httpx,
         "AsyncClient",
@@ -87,15 +100,56 @@ def test_proxy_recommend_wraps_upstream_payload(monkeypatch: pytest.MonkeyPatch)
             json={
                 "resume_text": "Experienced backend python engineer building API services.",
                 "postings": ["Backend Engineer", "ML Engineer"],
+                "profile_id": "wesley_remote",
+                "preferred_keywords": [],
+                "preferred_locations": [],
+                "preferred_companies": [],
+                "remote_only": None,
             },
         )
 
     body = proxy_response.json()
     assert proxy_response.status_code == 200
     assert "gateway_generated_at" in body
+    assert body["upstream_request_id"] == "req-123"
+    assert body["upstream_audit_event_id"] == "71"
     assert body["recommender_response"] == upstream_payload
+    assert capture["method"] == "POST"
     assert capture["url"].endswith("/recommend")
+    assert capture["json"]["profile_id"] == "wesley_remote"
     assert [posting["id"] for posting in capture["json"]["postings"]] == ["job-1", "job-2"]
+
+
+def test_proxy_profile_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    capture: dict[str, Any] = {}
+    upstream_payload = {"profile_id": "wesley_remote", "name": "Wesley Remote"}
+    response = StubResponse(status_code=200, payload=upstream_payload)
+    monkeypatch.setattr(
+        frontend_main.httpx,
+        "AsyncClient",
+        lambda *_, **__: StubAsyncClient(response=response, capture=capture),
+    )
+
+    with TestClient(frontend_main.app) as client:
+        upsert = client.post(
+            "/api/profiles",
+            json={
+                "profile_id": "wesley_remote",
+                "name": "Wesley Remote",
+                "preferred_keywords": ["python"],
+                "preferred_locations": ["remote"],
+                "preferred_companies": ["acme"],
+                "remote_only": True,
+            },
+        )
+        listed = client.get("/api/profiles")
+        deleted = client.delete("/api/profiles/wesley_remote")
+
+    assert upsert.status_code == 200
+    assert listed.status_code == 200
+    assert deleted.status_code == 200
+    assert capture["url"].endswith("/profiles/wesley_remote")
+    assert capture["method"] == "DELETE"
 
 
 def test_proxy_scan_wraps_upstream_payload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -118,6 +172,7 @@ def test_proxy_scan_wraps_upstream_payload(monkeypatch: pytest.MonkeyPatch) -> N
     assert proxy_response.status_code == 200
     assert "gateway_generated_at" in body
     assert body["recommender_response"] == upstream_payload
+    assert capture["method"] == "POST"
     assert capture["url"].endswith("/postings")
     assert [posting["id"] for posting in capture["json"]["postings"]] == ["job-1", "job-2"]
 
@@ -149,7 +204,7 @@ def test_proxy_scan_sources_wraps_upstream_payload(monkeypatch: pytest.MonkeyPat
     assert capture["url"].endswith("/job-sources/scan?enabled_only=true")
 
 
-def test_proxy_scan_sources_maps_upstream_errors_to_502(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_proxy_scan_sources_maps_upstream_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     capture: dict[str, Any] = {}
     error_response = StubResponse(status_code=500, payload={"detail": "failure"})
     monkeypatch.setattr(
@@ -162,12 +217,12 @@ def test_proxy_scan_sources_maps_upstream_errors_to_502(monkeypatch: pytest.Monk
         response = client.post("/api/scan/sources", json={"enabled_only": True})
 
     assert response.status_code == 502
-    assert response.json() == {"detail": "Upstream recommender request failed"}
+    assert response.json() == {"detail": "failure"}
 
 
-def test_proxy_recommend_maps_upstream_errors_to_502(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_proxy_recommend_maps_upstream_client_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     capture: dict[str, Any] = {}
-    error_response = StubResponse(status_code=500, payload={"detail": "failure"})
+    error_response = StubResponse(status_code=404, payload={"detail": "Unknown profile_id"})
     monkeypatch.setattr(
         frontend_main.httpx,
         "AsyncClient",
@@ -179,28 +234,13 @@ def test_proxy_recommend_maps_upstream_errors_to_502(monkeypatch: pytest.MonkeyP
             "/api/recommend",
             json={
                 "resume_text": "Experienced backend python engineer building API services.",
-                "postings": ["Backend Engineer"],
+                "postings": [],
+                "profile_id": "missing",
             },
         )
 
-    assert response.status_code == 502
-    assert response.json() == {"detail": "Upstream recommender request failed"}
-
-
-def test_proxy_scan_maps_upstream_errors_to_502(monkeypatch: pytest.MonkeyPatch) -> None:
-    capture: dict[str, Any] = {}
-    error_response = StubResponse(status_code=500, payload={"detail": "failure"})
-    monkeypatch.setattr(
-        frontend_main.httpx,
-        "AsyncClient",
-        lambda *_, **__: StubAsyncClient(response=error_response, capture=capture),
-    )
-
-    with TestClient(frontend_main.app) as client:
-        response = client.post("/api/scan", json={"postings": ["Backend Engineer"]})
-
-    assert response.status_code == 502
-    assert response.json() == {"detail": "Upstream recommender request failed"}
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Unknown profile_id"}
 
 
 def test_proxy_recommend_maps_upstream_connectivity_errors_to_502(

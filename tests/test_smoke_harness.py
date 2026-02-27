@@ -13,9 +13,15 @@ pytestmark = [pytest.mark.integration, pytest.mark.smoke]
 
 
 class StubResponse:
-    def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self) -> dict[str, Any]:
         return self._payload
@@ -31,13 +37,14 @@ class StubAsyncClient:
     async def __aexit__(self, *_: object) -> bool:
         return False
 
-    async def post(
+    async def request(
         self,
+        method: str,
         url: str,
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> StubResponse:
-        del url, json, headers
+        del method, url, json, headers
         return self.response
 
 

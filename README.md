@@ -58,6 +58,9 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /`
   - `POST /api/scan`
   - `POST /api/scan/sources`
+  - `POST /api/profiles`
+  - `GET /api/profiles`
+  - `DELETE /api/profiles/{profile_id}`
   - `POST /api/recommend`
 - `emailer`: FastAPI async worker trigger API
   - `GET /health`
@@ -176,7 +179,8 @@ Use the helper scanner script to ingest posting files quickly:
 ./scripts/scan_postings.sh ./scripts/example_postings.json
 ```
 
-The frontend UI now supports three actions in one screen:
+The frontend UI now supports profile + scan + recommend actions in one screen:
+- `Save Profile`/`Load Profiles`/`Delete Profile`
 - `Scan Postings` -> stores postings in recommender persistence
 - `Scan Configured Sources` -> runs all enabled `job_sources`
 - `Get Recommendations` -> recommends from the current textarea postings
@@ -323,6 +327,7 @@ The recommender now emits baseline observability signals for both humans and AI 
 - protected write/read actions include `x-audit-event-id`
 - structured JSON request completion logs are emitted (method/path/status/duration)
 - `GET /metrics` returns JSON counters and latency aggregates by endpoint
+- frontend proxy responses include `upstream_request_id` and `upstream_audit_event_id` for traceability
 
 ## Terraform IaC
 
