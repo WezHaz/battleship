@@ -47,6 +47,7 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /profiles`
   - `GET /profiles/{profile_id}`
   - `DELETE /profiles/{profile_id}`
+  - `GET /audit-events`
   - `POST /recommend`
   - `GET /recommendations/history`
 - `frontend`: FastAPI gateway + simple UI
@@ -246,9 +247,39 @@ Set `RECOMMENDER_API_KEY` to protect write endpoints:
 - `POST /job-sources/scan`
 - `POST /profiles`
 - `DELETE /profiles/{profile_id}`
+- `GET /audit-events`
 
 When enabled, send the key in `x-api-key`.  
 The frontend forwards this header automatically when `RECOMMENDER_API_KEY` is configured for the frontend service too.
+
+### Scoped API tokens + audit logging
+
+For scoped auth, set `RECOMMENDER_API_TOKENS_JSON` as a JSON map of token -> scopes:
+
+```bash
+export RECOMMENDER_API_TOKENS_JSON='{
+  "token-postings": ["postings:write"],
+  "token-scan": ["scan"],
+  "token-profiles": ["profiles:write"],
+  "token-audit": ["audit:read"],
+  "token-admin": ["*"]
+}'
+```
+
+Scope usage:
+- `postings:write` for posting writes
+- `sources:write` for source registration
+- `scan` for source scans
+- `profiles:write` for profile create/delete
+- `audit:read` for audit event access
+
+Audit events are recorded for protected actions with:
+- endpoint method/path
+- action name
+- required scope
+- source IP/user agent
+- auth subject fingerprint
+- status (`ok`, `unauthorized`, `forbidden`, `not_found`, `error`)
 
 ## Terraform IaC
 

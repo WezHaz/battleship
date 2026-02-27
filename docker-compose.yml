@@ -7,6 +7,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://battleship:battleship@postgres:5432/battleship}
       RECOMMENDER_DB_PATH: ${RECOMMENDER_DB_PATH:-/var/lib/operation-battleship/recommender.sqlite3}
       RECOMMENDER_API_KEY: ${RECOMMENDER_API_KEY:-}
+      RECOMMENDER_API_TOKENS_JSON: ${RECOMMENDER_API_TOKENS_JSON:-}
     depends_on:
       - postgres
     ports:

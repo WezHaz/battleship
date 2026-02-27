@@ -76,6 +76,34 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def parse_api_tokens(raw: str) -> dict[str, set[str]]:
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("RECOMMENDER_API_TOKENS_JSON must be a JSON object.")
+
+    token_map: dict[str, set[str]] = {}
+    for token, scopes_value in parsed.items():
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError("Token keys must be non-empty strings.")
+        if isinstance(scopes_value, str):
+            scopes = {scopes_value.strip()} if scopes_value.strip() else set()
+        elif isinstance(scopes_value, list):
+            scopes = {
+                str(scope).strip()
+                for scope in scopes_value
+                if isinstance(scope, str) and scope.strip()
+            }
+        else:
+            raise ValueError("Token scopes must be a string or list of strings.")
+        token_map[token] = scopes
+    return token_map
+
+
+def build_auth_subject(token: str) -> str:
+    token_digest = hashlib.sha1(token.encode()).hexdigest()[:12]
+    return f"token:{token_digest}"
+
+
 class JobPosting(BaseModel):
     id: str = Field(..., description="Unique job identifier")
     title: str
@@ -272,6 +300,20 @@ class UpsertSummary(BaseModel):
     possible_duplicates: int
 
 
+class AuditEvent(BaseModel):
+    event_id: int
+    occurred_at: str
+    method: str
+    path: str
+    action: str
+    scope: str | None = None
+    source_ip: str | None = None
+    user_agent: str | None = None
+    auth_subject: str | None = None
+    status: str
+    message: str | None = None
+
+
 class RecommenderRepository:
     def __init__(self, database_path: str) -> None:
         self.database_path = Path(database_path)
@@ -345,6 +387,20 @@ class RecommenderRepository:
                     config_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    occurred_at TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    scope TEXT,
+                    source_ip TEXT,
+                    user_agent TEXT,
+                    auth_subject TEXT,
+                    status TEXT NOT NULL,
+                    message TEXT
                 );
                 """
             )
@@ -746,6 +802,89 @@ class RecommenderRepository:
             self.connection.commit()
             return cursor.rowcount > 0
 
+    def record_audit_event(
+        self,
+        *,
+        method: str,
+        path: str,
+        action: str,
+        scope: str | None,
+        source_ip: str | None,
+        user_agent: str | None,
+        auth_subject: str | None,
+        status: str,
+        message: str | None,
+    ) -> None:
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO audit_events (
+                    occurred_at,
+                    method,
+                    path,
+                    action,
+                    scope,
+                    source_ip,
+                    user_agent,
+                    auth_subject,
+                    status,
+                    message
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_utc_iso(),
+                    method,
+                    path,
+                    action,
+                    scope,
+                    source_ip,
+                    user_agent,
+                    auth_subject,
+                    status,
+                    message,
+                ),
+            )
+            self.connection.commit()
+
+    def list_audit_events(
+        self,
+        *,
+        limit: int,
+        action: str | None,
+        status: str | None,
+    ) -> list[AuditEvent]:
+        with self._lock:
+            query = """
+                SELECT
+                    id AS event_id,
+                    occurred_at,
+                    method,
+                    path,
+                    action,
+                    scope,
+                    source_ip,
+                    user_agent,
+                    auth_subject,
+                    status,
+                    message
+                FROM audit_events
+            """
+            params: list[Any] = []
+            filters: list[str] = []
+            if action:
+                filters.append("action = ?")
+                params.append(action)
+            if status:
+                filters.append("status = ?")
+                params.append(status)
+            if filters:
+                query += " WHERE " + " AND ".join(filters)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            cursor = self.connection.execute(query, tuple(params))
+            return [AuditEvent(**dict(row)) for row in cursor.fetchall()]
+
     def update_job_source_scan_state(
         self,
         source_id: str,
@@ -1050,30 +1189,96 @@ def create_app(
     *,
     database_path: str | None = None,
     api_key: str | None = None,
+    api_tokens: dict[str, list[str] | set[str]] | None = None,
 ) -> FastAPI:
     resolved_path = database_path or os.getenv("RECOMMENDER_DB_PATH", DEFAULT_DB_PATH)
     resolved_api_key = (api_key or os.getenv("RECOMMENDER_API_KEY", "")).strip() or None
+    resolved_token_map: dict[str, set[str]] = {}
+    if api_tokens is not None:
+        resolved_token_map = {
+            token: {str(scope).strip() for scope in scopes if str(scope).strip()}
+            for token, scopes in api_tokens.items()
+            if token.strip()
+        }
+    else:
+        raw_tokens = os.getenv("RECOMMENDER_API_TOKENS_JSON", "").strip()
+        if raw_tokens:
+            resolved_token_map = parse_api_tokens(raw_tokens)
+
+    if resolved_api_key:
+        resolved_token_map.setdefault(resolved_api_key, set()).add("*")
+
     repository = RecommenderRepository(database_path=resolved_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await run_in_threadpool(repository.connect)
         app.state.repository = repository
-        app.state.api_key = resolved_api_key
+        app.state.auth_token_scopes = resolved_token_map
         try:
             yield
         finally:
             await run_in_threadpool(repository.close)
 
-    app = FastAPI(title="OperationBattleship Recommender", version="0.4.0", lifespan=lifespan)
+    app = FastAPI(title="OperationBattleship Recommender", version="0.5.0", lifespan=lifespan)
 
-    def require_api_key(request: Request) -> None:
-        expected = request.app.state.api_key
-        if not expected:
-            return
+    async def write_audit_event(
+        request: Request,
+        *,
+        action: str,
+        scope: str | None,
+        status: str,
+        message: str | None = None,
+        auth_subject: str | None = None,
+    ) -> None:
+        source_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent")
+        await run_in_threadpool(
+            request.app.state.repository.record_audit_event,
+            method=request.method,
+            path=request.url.path,
+            action=action,
+            scope=scope,
+            source_ip=source_ip,
+            user_agent=user_agent,
+            auth_subject=auth_subject,
+            status=status,
+            message=message,
+        )
+
+    async def require_scope(
+        request: Request,
+        *,
+        action: str,
+        scope: str,
+    ) -> str | None:
+        token_map: dict[str, set[str]] = request.app.state.auth_token_scopes
+        if not token_map:
+            return None
         provided = request.headers.get("x-api-key", "")
-        if provided != expected:
+        scopes = token_map.get(provided)
+        if not provided or scopes is None:
+            await write_audit_event(
+                request,
+                action=action,
+                scope=scope,
+                status="unauthorized",
+                message="missing or invalid api key",
+            )
             raise HTTPException(status_code=401, detail="Unauthorized")
+
+        auth_subject = build_auth_subject(provided)
+        if "*" not in scopes and scope not in scopes:
+            await write_audit_event(
+                request,
+                action=action,
+                scope=scope,
+                status="forbidden",
+                message="missing required scope",
+                auth_subject=auth_subject,
+            )
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return auth_subject
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -1084,10 +1289,22 @@ def create_app(
         payload: UpsertPostingsRequest,
         request: Request,
     ) -> UpsertPostingsResponse:
-        require_api_key(request)
+        auth_subject = await require_scope(
+            request,
+            action="postings_upsert",
+            scope="postings:write",
+        )
         updated = await run_in_threadpool(
             request.app.state.repository.upsert_postings,
             payload.postings,
+        )
+        await write_audit_event(
+            request,
+            action="postings_upsert",
+            scope="postings:write",
+            status="ok",
+            message=f"updated={updated}",
+            auth_subject=auth_subject,
         )
         return UpsertPostingsResponse(updated=updated)
 
@@ -1100,8 +1317,21 @@ def create_app(
 
     @app.post("/job-sources", response_model=JobSource)
     async def upsert_job_source(payload: JobSourceUpsertRequest, request: Request) -> JobSource:
-        require_api_key(request)
-        return await run_in_threadpool(request.app.state.repository.upsert_job_source, payload)
+        auth_subject = await require_scope(
+            request,
+            action="job_source_upsert",
+            scope="sources:write",
+        )
+        source = await run_in_threadpool(request.app.state.repository.upsert_job_source, payload)
+        await write_audit_event(
+            request,
+            action="job_source_upsert",
+            scope="sources:write",
+            status="ok",
+            message=f"source_id={source.source_id}",
+            auth_subject=auth_subject,
+        )
+        return source
 
     @app.get("/job-sources", response_model=list[JobSource])
     async def list_job_sources(
@@ -1112,17 +1342,48 @@ def create_app(
 
     @app.post("/job-sources/{source_id}/scan", response_model=JobSourceScanResult)
     async def scan_job_source(source_id: str, request: Request) -> JobSourceScanResult:
-        require_api_key(request)
+        auth_subject = await require_scope(
+            request,
+            action="job_source_scan_one",
+            scope="scan",
+        )
         source = await run_in_threadpool(request.app.state.repository.get_job_source, source_id)
         if source is None:
+            await write_audit_event(
+                request,
+                action="job_source_scan_one",
+                scope="scan",
+                status="not_found",
+                message=f"source_id={source_id}",
+                auth_subject=auth_subject,
+            )
             raise HTTPException(status_code=404, detail="Unknown source_id")
 
         result = await run_in_threadpool(scan_source, request.app.state.repository, source)
         if result.status == "error":
+            await write_audit_event(
+                request,
+                action="job_source_scan_one",
+                scope="scan",
+                status="error",
+                message=f"source_id={source_id}; error={result.error}",
+                auth_subject=auth_subject,
+            )
             raise HTTPException(
                 status_code=502,
                 detail={"source_id": result.source_id, "error": result.error},
             )
+        await write_audit_event(
+            request,
+            action="job_source_scan_one",
+            scope="scan",
+            status="ok",
+            message=(
+                f"source_id={source_id}; ingested={result.ingested}; "
+                f"possible_duplicates={result.possible_duplicates}"
+            ),
+            auth_subject=auth_subject,
+        )
         return result
 
     @app.post("/job-sources/scan", response_model=JobSourceScanBatchResponse)
@@ -1130,7 +1391,11 @@ def create_app(
         request: Request,
         enabled_only: bool = Query(default=True),
     ) -> JobSourceScanBatchResponse:
-        require_api_key(request)
+        auth_subject = await require_scope(
+            request,
+            action="job_source_scan_all",
+            scope="scan",
+        )
         sources = await run_in_threadpool(
             request.app.state.repository.list_job_sources,
             enabled_only,
@@ -1140,7 +1405,7 @@ def create_app(
             result = await run_in_threadpool(scan_source, request.app.state.repository, source)
             results.append(result)
 
-        return JobSourceScanBatchResponse(
+        batch = JobSourceScanBatchResponse(
             scanned_at=now_utc_iso(),
             requested_sources=len(sources),
             successful_sources=sum(1 for result in results if result.status == "ok"),
@@ -1149,14 +1414,39 @@ def create_app(
             possible_duplicates=sum(result.possible_duplicates for result in results),
             results=results,
         )
+        await write_audit_event(
+            request,
+            action="job_source_scan_all",
+            scope="scan",
+            status="ok" if batch.failed_sources == 0 else "partial",
+            message=(
+                f"requested={batch.requested_sources}; success={batch.successful_sources}; "
+                f"failed={batch.failed_sources}; ingested={batch.total_ingested}"
+            ),
+            auth_subject=auth_subject,
+        )
+        return batch
 
     @app.post("/profiles", response_model=UserPreferenceProfile)
     async def upsert_profile(
         payload: UserProfileUpsertRequest,
         request: Request,
     ) -> UserPreferenceProfile:
-        require_api_key(request)
-        return await run_in_threadpool(request.app.state.repository.upsert_user_profile, payload)
+        auth_subject = await require_scope(
+            request,
+            action="profile_upsert",
+            scope="profiles:write",
+        )
+        profile = await run_in_threadpool(request.app.state.repository.upsert_user_profile, payload)
+        await write_audit_event(
+            request,
+            action="profile_upsert",
+            scope="profiles:write",
+            status="ok",
+            message=f"profile_id={profile.profile_id}",
+            auth_subject=auth_subject,
+        )
+        return profile
 
     @app.get("/profiles", response_model=list[UserPreferenceProfile])
     async def list_profiles(request: Request) -> list[UserPreferenceProfile]:
@@ -1171,14 +1461,62 @@ def create_app(
 
     @app.delete("/profiles/{profile_id}")
     async def delete_profile(profile_id: str, request: Request) -> dict[str, bool]:
-        require_api_key(request)
+        auth_subject = await require_scope(
+            request,
+            action="profile_delete",
+            scope="profiles:write",
+        )
         deleted = await run_in_threadpool(
             request.app.state.repository.delete_user_profile,
             profile_id,
         )
         if not deleted:
+            await write_audit_event(
+                request,
+                action="profile_delete",
+                scope="profiles:write",
+                status="not_found",
+                message=f"profile_id={profile_id}",
+                auth_subject=auth_subject,
+            )
             raise HTTPException(status_code=404, detail="Unknown profile_id")
+        await write_audit_event(
+            request,
+            action="profile_delete",
+            scope="profiles:write",
+            status="ok",
+            message=f"profile_id={profile_id}",
+            auth_subject=auth_subject,
+        )
         return {"deleted": True}
+
+    @app.get("/audit-events", response_model=list[AuditEvent])
+    async def list_audit_events(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=500),
+        action: str | None = None,
+        status: str | None = None,
+    ) -> list[AuditEvent]:
+        auth_subject = await require_scope(
+            request,
+            action="audit_events_list",
+            scope="audit:read",
+        )
+        events = await run_in_threadpool(
+            request.app.state.repository.list_audit_events,
+            limit=limit,
+            action=action,
+            status=status,
+        )
+        await write_audit_event(
+            request,
+            action="audit_events_list",
+            scope="audit:read",
+            status="ok",
+            message=f"returned={len(events)}",
+            auth_subject=auth_subject,
+        )
+        return events
 
     @app.get("/recommendations/history", response_model=RecommendationHistoryResponse)
     async def recommendation_history(
