@@ -1481,8 +1481,12 @@ class RecommenderRepository:
         self,
         *,
         limit: int,
+        offset: int,
         source_id: str | None,
         trigger: str | None,
+        status: str | None,
+        scanned_after: str | None,
+        scanned_before: str | None,
     ) -> list[JobSourceScanHistoryItem]:
         with self._lock:
             query = """
@@ -1510,10 +1514,20 @@ class RecommenderRepository:
             if trigger:
                 filters.append("trigger = ?")
                 params.append(trigger)
+            if status:
+                filters.append("status = ?")
+                params.append(status)
+            if scanned_after:
+                filters.append("scanned_at >= ?")
+                params.append(scanned_after)
+            if scanned_before:
+                filters.append("scanned_at <= ?")
+                params.append(scanned_before)
             if filters:
                 query += " WHERE " + " AND ".join(filters)
-            query += " ORDER BY id DESC LIMIT ?"
+            query += " ORDER BY id DESC LIMIT ? OFFSET ?"
             params.append(limit)
+            params.append(offset)
             cursor = self.connection.execute(query, tuple(params))
             rows = cursor.fetchall()
             return [
@@ -2291,9 +2305,17 @@ def create_app(
         request: Request,
         response: Response,
         limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0, le=10000),
         source_id: str | None = None,
         trigger: Literal["manual", "scheduled"] | None = None,
+        status: Literal["ok", "error", "skipped"] | None = None,
+        scanned_after: str | None = None,
+        scanned_before: str | None = None,
     ) -> list[JobSourceScanHistoryItem]:
+        if scanned_after and parse_iso_datetime(scanned_after) is None:
+            raise HTTPException(status_code=422, detail="Invalid scanned_after timestamp")
+        if scanned_before and parse_iso_datetime(scanned_before) is None:
+            raise HTTPException(status_code=422, detail="Invalid scanned_before timestamp")
         auth_subject = await require_scope(
             request,
             action="job_source_scan_history",
@@ -2302,8 +2324,12 @@ def create_app(
         history = await run_in_threadpool(
             request.app.state.repository.list_job_source_scan_history,
             limit=limit,
+            offset=offset,
             source_id=source_id,
             trigger=trigger,
+            status=status,
+            scanned_after=scanned_after,
+            scanned_before=scanned_before,
         )
         event_id = await write_audit_event(
             request,
@@ -2311,8 +2337,9 @@ def create_app(
             scope="scan",
             status="ok",
             message=(
-                f"returned={len(history)}; source_id={source_id or '*'}; "
-                f"trigger={trigger or '*'}"
+                f"returned={len(history)}; limit={limit}; offset={offset}; "
+                f"source_id={source_id or '*'}; trigger={trigger or '*'}; "
+                f"status_filter={status or '*'}"
             ),
             auth_subject=auth_subject,
         )

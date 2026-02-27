@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Literal
+from urllib.parse import urlencode
 
 import httpx
 from common.utils import now_utc_iso
@@ -173,16 +174,34 @@ async def index() -> str:
       <label><input type=\"checkbox\" id=\"sources_enabled_only\" /> Enabled Only</label>
       <label>Scan Trigger</label>
       <select id=\"source_scan_trigger\">
+        <option value=\"all\">All</option>
         <option value=\"manual\">Manual</option>
         <option value=\"scheduled\">Scheduled</option>
       </select>
       <label><input type=\"checkbox\" id=\"source_scan_backoff\" /> Respect Backoff</label>
       <label>History Source Filter (optional)</label>
       <input id=\"scan_history_source_id\" placeholder=\"source_id\" />
+      <label>History Status</label>
+      <select id=\"scan_history_status\">
+        <option value=\"all\">All</option>
+        <option value=\"ok\">OK</option>
+        <option value=\"error\">Error</option>
+        <option value=\"skipped\">Skipped</option>
+      </select>
+      <label>History Scanned After (local time, optional)</label>
+      <input id=\"scan_history_after\" type=\"datetime-local\" />
+      <label>History Scanned Before (local time, optional)</label>
+      <input id=\"scan_history_before\" type=\"datetime-local\" />
+      <label>History Page Size</label>
+      <input id=\"scan_history_limit\" type=\"number\" min=\"1\" max=\"100\" value=\"25\" />
       <button onclick=\"loadSources()\">Load Sources</button>
       <button onclick=\"scanConfiguredSources()\">Scan All Sources</button>
       <button onclick=\"loadScanHistory()\">Load Scan History</button>
+      <button onclick=\"scanHistoryPreviousPage()\">History Previous</button>
+      <button onclick=\"scanHistoryNextPage()\">History Next</button>
       <div id=\"sources_list\"></div>
+      <div id=\"scan_history_pagination\"></div>
+      <div id=\"scan_history_list\"></div>
     </div>
 
     <h2>Response</h2>
@@ -190,6 +209,8 @@ async def index() -> str:
 
     <script>
       let sourceCache = [];
+      let scanHistoryCache = [];
+      let scanHistoryOffset = 0;
 
       function parseCsv(value) {
         return value
@@ -212,14 +233,41 @@ async def index() -> str:
         return null;
       }
 
+      function readHistoryLimit() {
+        const limitInput = document.getElementById('scan_history_limit').value || '25';
+        const raw = Number.parseInt(limitInput, 10);
+        if (!Number.isFinite(raw)) return 25;
+        return Math.min(100, Math.max(1, raw));
+      }
+
+      function datetimeLocalToIso(value) {
+        if (!value) return null;
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return null;
+        return parsed.toISOString();
+      }
+
       function readSourceScanOptions() {
         const enabledOnly = document.getElementById('sources_enabled_only').checked;
         const trigger = document.getElementById('source_scan_trigger').value;
         const respectBackoff = document.getElementById('source_scan_backoff').checked;
         return {
           enabled_only: enabledOnly,
-          trigger,
+          trigger: trigger === 'all' ? 'manual' : trigger,
           respect_backoff: trigger === 'scheduled' ? true : respectBackoff
+        };
+      }
+
+      function readScanHistoryFilters() {
+        const triggerValue = document.getElementById('source_scan_trigger').value;
+        const statusValue = document.getElementById('scan_history_status').value;
+        return {
+          source_id: document.getElementById('scan_history_source_id').value.trim() || null,
+          trigger: triggerValue === 'all' ? null : triggerValue,
+          status: statusValue === 'all' ? null : statusValue,
+          scanned_after: datetimeLocalToIso(document.getElementById('scan_history_after').value),
+          scanned_before: datetimeLocalToIso(document.getElementById('scan_history_before').value),
+          limit: readHistoryLimit()
         };
       }
 
@@ -299,6 +347,70 @@ async def index() -> str:
         `;
       }
 
+      function renderScanHistory() {
+        const container = document.getElementById('scan_history_list');
+        const pageInfo = document.getElementById('scan_history_pagination');
+        const limit = readHistoryLimit();
+        const pageNumber = Math.floor(scanHistoryOffset / limit) + 1;
+        const hasNext = scanHistoryCache.length === limit;
+        const pageMeta = `(offset=${scanHistoryOffset}, items=${scanHistoryCache.length})`;
+
+        pageInfo.textContent = `History page ${pageNumber} ${pageMeta}`;
+
+        if (!scanHistoryCache.length) {
+          container.innerHTML = '<p>No scan history rows found for current filters.</p>';
+          return;
+        }
+
+        const rows = scanHistoryCache.map(item => {
+          const sourceId = escapeHtml(item.source_id || '');
+          const scannedAt = escapeHtml(item.scanned_at || '');
+          const trigger = escapeHtml(item.trigger || '');
+          const status = escapeHtml(item.status || '');
+          const ingested = Number(item.ingested || 0);
+          const fetched = Number(item.fetched || 0);
+          const duplicates = Number(item.possible_duplicates || 0);
+          const attempt = Number(item.attempt_number || 0);
+          const backoff = Number(item.backoff_seconds || 0);
+          const error = escapeHtml(item.error || '');
+          return `
+            <tr>
+              <td>${scannedAt}</td>
+              <td>${sourceId}</td>
+              <td>${trigger}</td>
+              <td>${status}</td>
+              <td>${fetched}</td>
+              <td>${ingested}</td>
+              <td>${duplicates}</td>
+              <td>${attempt}</td>
+              <td>${backoff}</td>
+              <td>${error}</td>
+            </tr>
+          `;
+        }).join('');
+
+        container.innerHTML = `
+          <table style="width:100%; border-collapse:collapse; margin-top:0.6rem;">
+            <thead>
+              <tr>
+                <th align="left">Scanned At</th>
+                <th align="left">Source</th>
+                <th align="left">Trigger</th>
+                <th align="left">Status</th>
+                <th align="left">Fetched</th>
+                <th align="left">Ingested</th>
+                <th align="left">Duplicates</th>
+                <th align="left">Attempt</th>
+                <th align="left">Backoff (s)</th>
+                <th align="left">Error</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+          <p>${hasNext ? 'More history is available.' : 'End of filtered history.'}</p>
+        `;
+      }
+
       function readProfilePayload() {
         return {
           profile_id: document.getElementById('profile_id').value.trim(),
@@ -361,15 +473,36 @@ async def index() -> str:
         await loadSources();
       }
 
-      async function loadScanHistory() {
-        const sourceId = document.getElementById('scan_history_source_id').value.trim();
-        const trigger = document.getElementById('source_scan_trigger').value;
+      async function loadScanHistory(resetOffset = true) {
+        if (resetOffset) {
+          scanHistoryOffset = 0;
+        }
+        const filters = readScanHistoryFilters();
         const params = new URLSearchParams();
-        params.set('limit', '50');
-        params.set('trigger', trigger);
-        if (sourceId) params.set('source_id', sourceId);
+        params.set('limit', String(filters.limit));
+        params.set('offset', String(scanHistoryOffset));
+        if (filters.source_id) params.set('source_id', filters.source_id);
+        if (filters.trigger) params.set('trigger', filters.trigger);
+        if (filters.status) params.set('status', filters.status);
+        if (filters.scanned_after) params.set('scanned_after', filters.scanned_after);
+        if (filters.scanned_before) params.set('scanned_before', filters.scanned_before);
         const data = await callApi(`/api/scan/history?${params.toString()}`, 'GET');
+        scanHistoryCache = data.recommender_response || [];
+        renderScanHistory();
         writeOutput(data);
+      }
+
+      async function scanHistoryNextPage() {
+        const limit = readHistoryLimit();
+        if (scanHistoryCache.length < limit) return;
+        scanHistoryOffset += limit;
+        await loadScanHistory(false);
+      }
+
+      async function scanHistoryPreviousPage() {
+        const limit = readHistoryLimit();
+        scanHistoryOffset = Math.max(0, scanHistoryOffset - limit);
+        await loadScanHistory(false);
       }
 
       async function submitData() {
@@ -403,6 +536,7 @@ async def index() -> str:
       }
 
       loadSources();
+      loadScanHistory();
     </script>
   </body>
 </html>
@@ -457,15 +591,25 @@ async def proxy_scan_one_source(
 @app.get("/api/scan/history")
 async def proxy_scan_history(
     limit: int = 50,
+    offset: int = 0,
     source_id: str | None = None,
     trigger: Literal["manual", "scheduled"] | None = None,
+    status: Literal["ok", "error", "skipped"] | None = None,
+    scanned_after: str | None = None,
+    scanned_before: str | None = None,
 ) -> dict[str, Any]:
-    query_parts = [f"limit={limit}"]
+    query_params: dict[str, Any] = {"limit": limit, "offset": offset}
     if source_id:
-        query_parts.append(f"source_id={source_id}")
+        query_params["source_id"] = source_id
     if trigger:
-        query_parts.append(f"trigger={trigger}")
-    query = "&".join(query_parts)
+        query_params["trigger"] = trigger
+    if status:
+        query_params["status"] = status
+    if scanned_after:
+        query_params["scanned_after"] = scanned_after
+    if scanned_before:
+        query_params["scanned_before"] = scanned_before
+    query = urlencode(query_params)
     return await request_to_recommender("GET", f"/job-sources/scan-history?{query}")
 
 

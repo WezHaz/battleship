@@ -193,7 +193,7 @@ The frontend UI now supports profile + scan + recommend actions in one screen:
 - `Save Profile`/`Load Profiles`/`Delete Profile`
 - `Scan Postings` -> stores postings in recommender persistence
 - `Scan Configured Sources` -> runs all enabled `job_sources`
-- `Source Scan Panel` -> defaults to listing all sources, supports manual/scheduled trigger, optional backoff, per-source scan, and scan history lookup
+- `Source Scan Panel` -> defaults to listing all sources, supports manual/scheduled trigger, optional backoff, per-source scan, and scan history lookup with pagination + status/source/trigger/date filters
 - `Get Recommendations` -> recommends from the current textarea postings
 - `Scan + Recommend` -> stores postings, then recommends using stored postings
 
@@ -226,7 +226,8 @@ Backoff + history endpoints:
 - `POST /job-sources/{source_id}/scan?respect_backoff=true` returns `status=skipped` if still in backoff
 - `POST /job-sources/scan` supports `enabled_only` and `respect_backoff`
 - `POST /job-sources/scan/scheduled` runs scheduled trigger mode with backoff enabled
-- `GET /job-sources/scan-history` supports `limit`, `source_id`, and `trigger` filters
+- `GET /job-sources/scan-history` supports `limit`, `offset`, `source_id`, `trigger`, `status`, `scanned_after`, and `scanned_before` filters
+- scheduler automation details are in `docs/operations/scheduled_scans_runbook.md`
 
 ## Recommendation personalization
 
@@ -374,6 +375,10 @@ Modules provision baseline AWS components:
 
 - `ci.yml`: sync deps, lint, test, and build Docker images
 - `release.yml`: build/push images and apply Terraform to selected environment
+
+## Possible updates backlog
+
+1. Add a Token Admin UI panel for API token lifecycle operations (list/create/revoke scoped tokens).
 
 ## Notes
 

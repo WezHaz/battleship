@@ -289,3 +289,48 @@ def test_scheduled_scan_endpoint_uses_scheduled_trigger(client: TestClient) -> N
     history = history_response.json()
     assert len(history) >= 1
     assert history[0]["trigger"] == "scheduled"
+
+
+def test_scan_history_supports_status_date_and_pagination(client: TestClient) -> None:
+    source_response = client.post(
+        "/job-sources",
+        json={
+            "source_id": "history_filter_demo",
+            "name": "History Filter Demo",
+            "source_type": "inline_json",
+            "postings": [{"title": "Platform Engineer", "description": "Build platform APIs"}],
+            "enabled": True,
+        },
+    )
+    assert source_response.status_code == 200
+
+    first_scan = client.post("/job-sources/history_filter_demo/scan")
+    second_scan = client.post("/job-sources/history_filter_demo/scan")
+    assert first_scan.status_code == 200
+    assert second_scan.status_code == 200
+
+    after_ts = "2020-01-01T00:00:00Z"
+    before_ts = "2099-01-01T00:00:00Z"
+    history_first_page = client.get(
+        "/job-sources/scan-history"
+        "?limit=1&offset=0&source_id=history_filter_demo&trigger=manual"
+        f"&status=ok&scanned_after={after_ts}&scanned_before={before_ts}"
+    )
+    assert history_first_page.status_code == 200
+    page_one = history_first_page.json()
+    assert len(page_one) == 1
+    assert page_one[0]["source_id"] == "history_filter_demo"
+    assert page_one[0]["status"] == "ok"
+
+    history_second_page = client.get(
+        "/job-sources/scan-history?limit=1&offset=1&source_id=history_filter_demo&status=ok"
+    )
+    assert history_second_page.status_code == 200
+    page_two = history_second_page.json()
+    assert len(page_two) == 1
+    assert page_two[0]["history_id"] != page_one[0]["history_id"]
+
+
+def test_scan_history_rejects_invalid_timestamps(client: TestClient) -> None:
+    response = client.get("/job-sources/scan-history?scanned_after=not-a-timestamp")
+    assert response.status_code == 422

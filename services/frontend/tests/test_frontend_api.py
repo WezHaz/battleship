@@ -277,15 +277,24 @@ def test_proxy_scan_history(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     with TestClient(frontend_main.app) as client:
-        proxy_response = client.get("/api/scan/history?limit=10&source_id=demo&trigger=manual")
+        proxy_response = client.get(
+            "/api/scan/history"
+            "?limit=10&offset=5&source_id=demo&trigger=manual&status=ok"
+            "&scanned_after=2026-02-01T00:00:00Z&scanned_before=2026-02-27T00:00:00Z"
+        )
 
     body = proxy_response.json()
     assert proxy_response.status_code == 200
     assert body["recommender_response"] == upstream_payload
     assert capture["method"] == "GET"
-    assert capture["url"].endswith(
-        "/job-sources/scan-history?limit=10&source_id=demo&trigger=manual"
-    )
+    assert "/job-sources/scan-history?" in capture["url"]
+    assert "limit=10" in capture["url"]
+    assert "offset=5" in capture["url"]
+    assert "source_id=demo" in capture["url"]
+    assert "trigger=manual" in capture["url"]
+    assert "status=ok" in capture["url"]
+    assert "scanned_after=" in capture["url"]
+    assert "scanned_before=" in capture["url"]
 
 
 def test_proxy_scan_sources_maps_upstream_errors(monkeypatch: pytest.MonkeyPatch) -> None:
