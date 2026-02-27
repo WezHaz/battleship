@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import httpx
 from common.utils import now_utc_iso
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="OperationBattleship Frontend", version="0.1.0")
 RECOMMENDER_BASE_URL = os.getenv("RECOMMENDER_BASE_URL", "http://localhost:8001")
+RECOMMENDER_API_KEY = os.getenv("RECOMMENDER_API_KEY", "").strip()
 
 
 class UIRecommendRequest(BaseModel):
@@ -21,6 +23,10 @@ class UIScanRequest(BaseModel):
     postings: list[str] = Field(default_factory=list, min_length=1)
 
 
+class UISourceScanRequest(BaseModel):
+    enabled_only: bool = True
+
+
 def build_postings(postings: list[str]) -> list[dict[str, str]]:
     return [
         {"id": f"job-{index + 1}", "title": posting, "description": posting}
@@ -28,12 +34,22 @@ def build_postings(postings: list[str]) -> list[dict[str, str]]:
     ]
 
 
-async def post_to_recommender(path: str, payload: dict) -> dict:
+def recommender_headers() -> dict[str, str]:
+    if not RECOMMENDER_API_KEY:
+        return {}
+    return {"x-api-key": RECOMMENDER_API_KEY}
+
+
+async def post_to_recommender(path: str, payload: dict[str, Any] | None = None) -> dict:
+    request_kwargs: dict[str, Any] = {"headers": recommender_headers()}
+    if payload is not None:
+        request_kwargs["json"] = payload
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
                 f"{RECOMMENDER_BASE_URL}{path}",
-                json=payload,
+                **request_kwargs,
             )
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail="Upstream recommender is unavailable") from exc
@@ -72,6 +88,7 @@ async def index() -> str:
     <textarea id=\"resume\" rows=\"8\" placeholder=\"Paste resume text\"></textarea>
     <label>Job postings (one per line)</label>
     <textarea id=\"postings\" rows=\"6\" placeholder=\"Backend Engineer\\nML Engineer\"></textarea>
+    <button onclick=\"scanConfiguredSources()\">Scan Configured Sources</button>
     <button onclick=\"scanPostings()\">Scan Postings</button>
     <button onclick=\"submitData()\">Get Recommendations</button>
     <button onclick=\"scanAndRecommend()\">Scan + Recommend</button>
@@ -105,6 +122,11 @@ async def index() -> str:
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
       }
 
+      async function scanConfiguredSources() {
+        const data = await callApi('/api/scan/sources', { enabled_only: true });
+        document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+      }
+
       async function submitData() {
         const resume = document.getElementById('resume').value;
         const postings = readPostings();
@@ -135,6 +157,18 @@ async def index() -> str:
 async def proxy_scan(payload: UIScanRequest) -> dict:
     recommender_payload = {"postings": build_postings(payload.postings)}
     recommender_response = await post_to_recommender("/postings", recommender_payload)
+    return {
+        "gateway_generated_at": now_utc_iso(),
+        "recommender_response": recommender_response,
+    }
+
+
+@app.post("/api/scan/sources")
+async def proxy_scan_sources(payload: UISourceScanRequest) -> dict:
+    recommender_response = await post_to_recommender(
+        f"/job-sources/scan?enabled_only={'true' if payload.enabled_only else 'false'}",
+        {},
+    )
     return {
         "gateway_generated_at": now_utc_iso(),
         "recommender_response": recommender_response,

@@ -31,8 +31,13 @@ class StubAsyncClient:
     async def __aexit__(self, *_: object) -> bool:
         return False
 
-    async def post(self, url: str, json: dict[str, Any]) -> StubResponse:
-        del url, json
+    async def post(
+        self,
+        url: str,
+        json: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> StubResponse:
+        del url, json, headers
         return self.response
 
 

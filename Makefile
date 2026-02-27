@@ -2,6 +2,7 @@ SHELL := /bin/bash
 
 .PHONY: init lock sync lint test test-smoke test-unit test-integration test-bdd dev down \
 	 run-recommender run-frontend run-emailer \
+	 register-source scan-sources \
 	 tf-init-dev tf-plan-dev tf-apply-dev \
 	 tf-init-prod tf-plan-prod tf-apply-prod
 
@@ -46,6 +47,12 @@ run-frontend:
 
 run-emailer:
 	uv run --package emailer-service uvicorn emailer.main:app --reload --host 0.0.0.0 --port 8002
+
+register-source:
+	@echo "Usage: ./scripts/register_job_source.sh <source_id> <source_name> <source_input>"
+
+scan-sources:
+	./scripts/scan_sources.sh
 
 tf-init-dev:
 	terraform -chdir=infra/environments/dev init

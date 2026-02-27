@@ -39,11 +39,16 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /health`
   - `POST /postings`
   - `GET /postings`
+  - `POST /job-sources`
+  - `GET /job-sources`
+  - `POST /job-sources/{source_id}/scan`
+  - `POST /job-sources/scan`
   - `POST /recommend`
   - `GET /recommendations/history`
 - `frontend`: FastAPI gateway + simple UI
   - `GET /`
   - `POST /api/scan`
+  - `POST /api/scan/sources`
   - `POST /api/recommend`
 - `emailer`: FastAPI async worker trigger API
   - `GET /health`
@@ -158,8 +163,40 @@ Use the helper scanner script to ingest posting files quickly:
 
 The frontend UI now supports three actions in one screen:
 - `Scan Postings` -> stores postings in recommender persistence
+- `Scan Configured Sources` -> runs all enabled `job_sources`
 - `Get Recommendations` -> recommends from the current textarea postings
 - `Scan + Recommend` -> stores postings, then recommends using stored postings
+
+## Job sources ingestion layer (automated scanning)
+
+Register a source, then run source scans on demand or from cron.
+
+```bash
+# Register inline source from a local JSON file
+./scripts/register_job_source.sh demo_local "Demo Local Source" ./scripts/example_postings.json
+
+# Register remote source from URL
+./scripts/register_job_source.sh remote_board "Remote Board" https://example.com/postings.json
+
+# Scan all enabled sources
+./scripts/scan_sources.sh
+```
+
+When a source scan runs:
+- postings are normalized and upserted into SQLite
+- source health is tracked (`last_scan_at`, `last_status`, `last_error`)
+- recommend calls can use stored postings with `"postings":[]`
+
+## Security hardening (current)
+
+Set `RECOMMENDER_API_KEY` to protect write endpoints:
+- `POST /postings`
+- `POST /job-sources`
+- `POST /job-sources/{source_id}/scan`
+- `POST /job-sources/scan`
+
+When enabled, send the key in `x-api-key`.  
+The frontend forwards this header automatically when `RECOMMENDER_API_KEY` is configured for the frontend service too.
 
 ## Terraform IaC
 

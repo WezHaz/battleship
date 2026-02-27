@@ -30,9 +30,15 @@ class StubAsyncClient:
     async def __aexit__(self, *_: object) -> bool:
         return False
 
-    async def post(self, url: str, json: dict[str, Any]) -> StubResponse:
+    async def post(
+        self,
+        url: str,
+        json: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> StubResponse:
         self.capture["url"] = url
         self.capture["json"] = json
+        self.capture["headers"] = headers or {}
         return self.response
 
 
