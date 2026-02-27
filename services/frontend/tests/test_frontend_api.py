@@ -87,6 +87,37 @@ def test_proxy_recommend_wraps_upstream_payload(monkeypatch: pytest.MonkeyPatch)
     assert [posting["id"] for posting in capture["json"]["postings"]] == ["job-1", "job-2"]
 
 
+def test_proxy_scan_wraps_upstream_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    capture: dict[str, Any] = {}
+    upstream_payload = {"updated": 2}
+    response = StubResponse(status_code=200, payload=upstream_payload)
+    monkeypatch.setattr(
+        frontend_main.httpx,
+        "AsyncClient",
+        lambda *_, **__: StubAsyncClient(response=response, capture=capture),
+    )
+
+    with TestClient(frontend_main.app) as client:
+        proxy_response = client.post(
+            "/api/scan",
+            json={"postings": ["Backend Engineer", "ML Engineer"]},
+        )
+
+    body = proxy_response.json()
+    assert proxy_response.status_code == 200
+    assert "gateway_generated_at" in body
+    assert body["recommender_response"] == upstream_payload
+    assert capture["url"].endswith("/postings")
+    assert [posting["id"] for posting in capture["json"]["postings"]] == ["job-1", "job-2"]
+
+
+def test_proxy_scan_rejects_empty_postings() -> None:
+    with TestClient(frontend_main.app) as client:
+        response = client.post("/api/scan", json={"postings": []})
+
+    assert response.status_code == 422
+
+
 def test_proxy_recommend_maps_upstream_errors_to_502(monkeypatch: pytest.MonkeyPatch) -> None:
     capture: dict[str, Any] = {}
     error_response = StubResponse(status_code=500, payload={"detail": "failure"})
@@ -104,6 +135,22 @@ def test_proxy_recommend_maps_upstream_errors_to_502(monkeypatch: pytest.MonkeyP
                 "postings": ["Backend Engineer"],
             },
         )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Upstream recommender request failed"}
+
+
+def test_proxy_scan_maps_upstream_errors_to_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    capture: dict[str, Any] = {}
+    error_response = StubResponse(status_code=500, payload={"detail": "failure"})
+    monkeypatch.setattr(
+        frontend_main.httpx,
+        "AsyncClient",
+        lambda *_, **__: StubAsyncClient(response=error_response, capture=capture),
+    )
+
+    with TestClient(frontend_main.app) as client:
+        response = client.post("/api/scan", json={"postings": ["Backend Engineer"]})
 
     assert response.status_code == 502
     assert response.json() == {"detail": "Upstream recommender request failed"}

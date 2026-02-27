@@ -17,6 +17,33 @@ class UIRecommendRequest(BaseModel):
     postings: list[str] = Field(default_factory=list)
 
 
+class UIScanRequest(BaseModel):
+    postings: list[str] = Field(default_factory=list, min_length=1)
+
+
+def build_postings(postings: list[str]) -> list[dict[str, str]]:
+    return [
+        {"id": f"job-{index + 1}", "title": posting, "description": posting}
+        for index, posting in enumerate(postings)
+    ]
+
+
+async def post_to_recommender(path: str, payload: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"{RECOMMENDER_BASE_URL}{path}",
+                json=payload,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail="Upstream recommender is unavailable") from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Upstream recommender request failed")
+
+    return response.json()
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "frontend"}
@@ -45,26 +72,58 @@ async def index() -> str:
     <textarea id=\"resume\" rows=\"8\" placeholder=\"Paste resume text\"></textarea>
     <label>Job postings (one per line)</label>
     <textarea id=\"postings\" rows=\"6\" placeholder=\"Backend Engineer\\nML Engineer\"></textarea>
+    <button onclick=\"scanPostings()\">Scan Postings</button>
     <button onclick=\"submitData()\">Get Recommendations</button>
+    <button onclick=\"scanAndRecommend()\">Scan + Recommend</button>
     <h2>Response</h2>
     <pre id=\"output\"></pre>
 
     <script>
-      async function submitData() {
-        const resume = document.getElementById('resume').value;
-        const postings = document.getElementById('postings').value
-          .split('\n')
-          .map(s => s.trim())
-          .filter(Boolean);
-
-        const response = await fetch('/api/recommend', {
+      async function callApi(path, payload) {
+        const response = await fetch(path, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resume_text: resume, postings })
+          body: JSON.stringify(payload)
         });
-
         const data = await response.json();
+        if (!response.ok) {
+          throw new Error(JSON.stringify(data));
+        }
+        return data;
+      }
+
+      function readPostings() {
+        return document.getElementById('postings').value
+          .split('\\n')
+          .map(s => s.trim())
+          .filter(Boolean);
+      }
+
+      async function scanPostings() {
+        const postings = readPostings();
+        const data = await callApi('/api/scan', { postings });
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+      }
+
+      async function submitData() {
+        const resume = document.getElementById('resume').value;
+        const postings = readPostings();
+        const data = await callApi('/api/recommend', { resume_text: resume, postings });
+        document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+      }
+
+      async function scanAndRecommend() {
+        const resume = document.getElementById('resume').value;
+        const postings = readPostings();
+        const scanData = await callApi('/api/scan', { postings });
+        const recommendData = await callApi(
+          '/api/recommend',
+          { resume_text: resume, postings: [] }
+        );
+        document.getElementById('output').textContent = JSON.stringify({
+          scan: scanData,
+          recommend: recommendData
+        }, null, 2);
       }
     </script>
   </body>
@@ -72,29 +131,24 @@ async def index() -> str:
 """
 
 
+@app.post("/api/scan")
+async def proxy_scan(payload: UIScanRequest) -> dict:
+    recommender_payload = {"postings": build_postings(payload.postings)}
+    recommender_response = await post_to_recommender("/postings", recommender_payload)
+    return {
+        "gateway_generated_at": now_utc_iso(),
+        "recommender_response": recommender_response,
+    }
+
+
 @app.post("/api/recommend")
 async def proxy_recommend(payload: UIRecommendRequest) -> dict:
     recommender_payload = {
         "resume_text": payload.resume_text,
-        "postings": [
-            {"id": f"job-{index + 1}", "title": posting, "description": posting}
-            for index, posting in enumerate(payload.postings)
-        ],
+        "postings": build_postings(payload.postings),
     }
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                f"{RECOMMENDER_BASE_URL}/recommend",
-                json=recommender_payload,
-            )
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail="Upstream recommender is unavailable") from exc
-
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="Upstream recommender request failed")
-
+    recommender_response = await post_to_recommender("/recommend", recommender_payload)
     return {
         "gateway_generated_at": now_utc_iso(),
-        "recommender_response": response.json(),
+        "recommender_response": recommender_response,
     }

@@ -43,6 +43,7 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /recommendations/history`
 - `frontend`: FastAPI gateway + simple UI
   - `GET /`
+  - `POST /api/scan`
   - `POST /api/recommend`
 - `emailer`: FastAPI async worker trigger API
   - `GET /health`
@@ -154,6 +155,11 @@ Use the helper scanner script to ingest posting files quickly:
 ```bash
 ./scripts/scan_postings.sh ./scripts/example_postings.json
 ```
+
+The frontend UI now supports three actions in one screen:
+- `Scan Postings` -> stores postings in recommender persistence
+- `Get Recommendations` -> recommends from the current textarea postings
+- `Scan + Recommend` -> stores postings, then recommends using stored postings
 
 ## Terraform IaC
 
