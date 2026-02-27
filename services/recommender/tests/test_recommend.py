@@ -46,3 +46,38 @@ def test_recommend_rejects_resume_shorter_than_minimum_length() -> None:
         response = client.post("/recommend", json=payload)
 
     assert response.status_code == 422
+
+
+def test_recommend_applies_preferences_and_returns_score_breakdown() -> None:
+    payload = {
+        "resume_text": "Backend engineer building reliable Python API services and tooling.",
+        "preferred_locations": ["Remote"],
+        "preferred_companies": ["Acme Labs"],
+        "preferred_keywords": ["python", "api", "backend"],
+        "remote_only": True,
+        "postings": [
+            {
+                "id": "job-1",
+                "title": "Backend Engineer",
+                "description": "Build Python API services",
+                "company": "Acme Labs",
+                "location": "Remote",
+            },
+            {
+                "id": "job-2",
+                "title": "Backend Engineer",
+                "description": "Build Java services",
+                "company": "Another Corp",
+                "location": "Onsite",
+            },
+        ],
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/recommend", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["recommendations"][0]["id"] == "job-1"
+    assert "score_breakdown" in body["recommendations"][0]
+    assert body["recommendations"][0]["score_breakdown"]["preference_bonus"] > 0

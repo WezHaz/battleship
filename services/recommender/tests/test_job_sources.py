@@ -96,6 +96,84 @@ def test_json_url_source_scan_fetches_remote_payload(
     assert body["ingested"] == 1
 
 
+def test_light_dedup_keeps_duplicates_without_external_ids(client: TestClient) -> None:
+    source_response = client.post(
+        "/job-sources",
+        json={
+            "source_id": "dupe_demo",
+            "name": "Duplicate Demo",
+            "source_type": "inline_json",
+            "postings": [
+                {
+                    "title": "Backend Engineer",
+                    "description": "Build Python APIs",
+                    "company": "Example Corp",
+                    "location": "Remote",
+                }
+            ],
+            "enabled": True,
+        },
+    )
+    assert source_response.status_code == 200
+
+    first_scan = client.post("/job-sources/dupe_demo/scan")
+    second_scan = client.post("/job-sources/dupe_demo/scan")
+    assert first_scan.status_code == 200
+    assert second_scan.status_code == 200
+
+    postings_response = client.get("/postings?limit=10")
+    assert postings_response.status_code == 200
+    postings = [item for item in postings_response.json() if item["source_id"] == "dupe_demo"]
+    assert len(postings) == 2
+    assert postings[0]["dedup_key"] == postings[1]["dedup_key"]
+    assert any(item["duplicate_hint_count"] >= 1 for item in postings)
+
+
+def test_external_id_dedup_updates_single_record(client: TestClient) -> None:
+    source_response = client.post(
+        "/job-sources",
+        json={
+            "source_id": "stable_external",
+            "name": "Stable External IDs",
+            "source_type": "inline_json",
+            "postings": [
+                {
+                    "external_id": "abc-1",
+                    "title": "Backend Engineer",
+                    "description": "Build APIs v1",
+                }
+            ],
+            "enabled": True,
+        },
+    )
+    assert source_response.status_code == 200
+    assert client.post("/job-sources/stable_external/scan").status_code == 200
+
+    update_source = client.post(
+        "/job-sources",
+        json={
+            "source_id": "stable_external",
+            "name": "Stable External IDs",
+            "source_type": "inline_json",
+            "postings": [
+                {
+                    "external_id": "abc-1",
+                    "title": "Backend Engineer",
+                    "description": "Build APIs v2",
+                }
+            ],
+            "enabled": True,
+        },
+    )
+    assert update_source.status_code == 200
+    assert client.post("/job-sources/stable_external/scan").status_code == 200
+
+    postings_response = client.get("/postings?limit=20")
+    postings = [item for item in postings_response.json() if item["source_id"] == "stable_external"]
+    assert len(postings) == 1
+    assert postings[0]["description"] == "Build APIs v2"
+
+
 def test_write_endpoints_require_api_key_when_configured(tmp_path: Path) -> None:
     db_path = tmp_path / "secured.sqlite3"
     app = create_app(database_path=str(db_path), api_key="secret-key")

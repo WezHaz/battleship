@@ -3,13 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib import request as urllib_request
+from urllib.parse import urlsplit
 
 from common.utils import now_utc_iso, tokenize
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -23,22 +26,99 @@ SOURCE_JSON_URL = "json_url"
 SOURCE_TYPES = (SOURCE_INLINE_JSON, SOURCE_JSON_URL)
 
 
+def normalize_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def normalize_text(text: str) -> str:
+    squashed = normalize_whitespace(text).lower()
+    alnum_only = re.sub(r"[^a-z0-9\s]+", " ", squashed)
+    return normalize_whitespace(alnum_only)
+
+
+def normalize_url(url: str | None) -> str:
+    if not url:
+        return ""
+    parsed = urlsplit(url.strip())
+    host = parsed.netloc.lower()
+    path = parsed.path.rstrip("/")
+    return f"{host}{path}"
+
+
+def build_dedup_key(
+    title: str,
+    company: str | None,
+    location: str | None,
+    apply_url: str | None,
+) -> str:
+    normalized_title = normalize_text(title)
+    normalized_company = normalize_text(company or "")
+    normalized_location = normalize_text(location or "")
+    normalized_apply_url = normalize_url(apply_url)
+    key_input = "|".join(
+        [
+            normalized_title,
+            normalized_company,
+            normalized_location,
+            normalized_apply_url,
+        ]
+    )
+    return hashlib.sha1(key_input.encode()).hexdigest()
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
 class JobPosting(BaseModel):
     id: str = Field(..., description="Unique job identifier")
     title: str
     description: str
+    company: str | None = None
+    location: str | None = None
+    apply_url: str | None = None
+    source_id: str | None = None
+    external_id: str | None = None
+    updated_at: str | None = None
+    dedup_key: str | None = None
+    duplicate_hint_count: int = 0
 
 
 class RecommendRequest(BaseModel):
     resume_text: str = Field(..., min_length=20)
     postings: list[JobPosting] = Field(default_factory=list)
     max_postings: int = Field(default=100, ge=1, le=500)
+    preferred_keywords: list[str] = Field(default_factory=list)
+    preferred_locations: list[str] = Field(default_factory=list)
+    preferred_companies: list[str] = Field(default_factory=list)
+    remote_only: bool = False
+
+
+class ScoreBreakdown(BaseModel):
+    title_overlap: float
+    description_overlap: float
+    preferred_keyword_overlap: float
+    preference_bonus: float
+    freshness_bonus: float
+    duplicate_penalty: float
+    final_score: float
 
 
 class RankedRecommendation(BaseModel):
     id: str
     title: str
+    company: str | None = None
+    location: str | None = None
+    apply_url: str | None = None
     score: float
+    matched_terms: list[str] = Field(default_factory=list)
+    score_breakdown: ScoreBreakdown
 
 
 class RecommendResponse(BaseModel):
@@ -60,6 +140,13 @@ class StoredPosting(BaseModel):
     id: str
     title: str
     description: str
+    company: str | None = None
+    location: str | None = None
+    apply_url: str | None = None
+    source_id: str | None = None
+    external_id: str | None = None
+    dedup_key: str
+    duplicate_hint_count: int
     updated_at: str
 
 
@@ -75,8 +162,12 @@ class RecommendationHistoryResponse(BaseModel):
 
 class IngestedPosting(BaseModel):
     id: str | None = None
+    external_id: str | None = None
     title: str = Field(..., min_length=1)
     description: str = Field(default="")
+    company: str | None = None
+    location: str | None = None
+    apply_url: str | None = None
 
 
 class JobSourceUpsertRequest(BaseModel):
@@ -121,6 +212,7 @@ class JobSourceScanResult(BaseModel):
     status: Literal["ok", "error"]
     fetched: int
     ingested: int
+    possible_duplicates: int
     error: str | None = None
 
 
@@ -130,7 +222,13 @@ class JobSourceScanBatchResponse(BaseModel):
     successful_sources: int
     failed_sources: int
     total_ingested: int
+    possible_duplicates: int
     results: list[JobSourceScanResult]
+
+
+class UpsertSummary(BaseModel):
+    updated: int
+    possible_duplicates: int
 
 
 class RecommenderRepository:
@@ -157,6 +255,18 @@ class RecommenderRepository:
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     description TEXT NOT NULL,
+                    company TEXT,
+                    location TEXT,
+                    apply_url TEXT,
+                    source_id TEXT,
+                    external_id TEXT,
+                    normalized_title TEXT NOT NULL DEFAULT '',
+                    normalized_company TEXT NOT NULL DEFAULT '',
+                    normalized_location TEXT NOT NULL DEFAULT '',
+                    normalized_url TEXT NOT NULL DEFAULT '',
+                    dedup_key TEXT NOT NULL DEFAULT '',
+                    duplicate_hint_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
 
@@ -189,7 +299,32 @@ class RecommenderRepository:
                 );
                 """
             )
+            self._ensure_job_postings_columns()
             self._connection.commit()
+
+    def _ensure_job_postings_columns(self) -> None:
+        column_rows = self.connection.execute("PRAGMA table_info(job_postings)").fetchall()
+        existing = {row["name"] for row in column_rows}
+        required_definitions = {
+            "company": "TEXT",
+            "location": "TEXT",
+            "apply_url": "TEXT",
+            "source_id": "TEXT",
+            "external_id": "TEXT",
+            "normalized_title": "TEXT NOT NULL DEFAULT ''",
+            "normalized_company": "TEXT NOT NULL DEFAULT ''",
+            "normalized_location": "TEXT NOT NULL DEFAULT ''",
+            "normalized_url": "TEXT NOT NULL DEFAULT ''",
+            "dedup_key": "TEXT NOT NULL DEFAULT ''",
+            "duplicate_hint_count": "INTEGER NOT NULL DEFAULT 0",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column_name, definition in required_definitions.items():
+            if column_name in existing:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE job_postings ADD COLUMN {column_name} {definition}"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -198,31 +333,131 @@ class RecommenderRepository:
             self._connection.close()
             self._connection = None
 
-    def upsert_postings(self, postings: list[JobPosting]) -> int:
+    def upsert_postings(
+        self,
+        postings: list[JobPosting],
+        *,
+        return_stats: bool = False,
+    ) -> int | UpsertSummary:
         with self._lock:
             if not postings:
+                if return_stats:
+                    return UpsertSummary(updated=0, possible_duplicates=0)
                 return 0
 
             now = now_utc_iso()
-            self.connection.executemany(
-                """
-                INSERT INTO job_postings (id, title, description, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    title = excluded.title,
-                    description = excluded.description,
-                    updated_at = excluded.updated_at
-                """,
-                [(posting.id, posting.title, posting.description, now) for posting in postings],
-            )
+            possible_duplicates = 0
+            for posting in postings:
+                title = normalize_whitespace(posting.title)
+                description = normalize_whitespace(posting.description) or title
+                company = normalize_whitespace(posting.company or "") or None
+                location = normalize_whitespace(posting.location or "") or None
+                apply_url = (posting.apply_url or "").strip() or None
+                source_id = (posting.source_id or "").strip() or None
+                external_id = (posting.external_id or "").strip() or None
+
+                normalized_title = normalize_text(title)
+                normalized_company = normalize_text(company or "")
+                normalized_location = normalize_text(location or "")
+                normalized_url = normalize_url(apply_url)
+                dedup_key = posting.dedup_key or build_dedup_key(
+                    title,
+                    company,
+                    location,
+                    apply_url,
+                )
+
+                duplicate_hint_count = int(
+                    self.connection.execute(
+                        """
+                        SELECT COUNT(1) AS c
+                        FROM job_postings
+                        WHERE dedup_key = ? AND id != ?
+                        """,
+                        (dedup_key, posting.id),
+                    ).fetchone()["c"]
+                )
+                if duplicate_hint_count > 0:
+                    possible_duplicates += 1
+
+                self.connection.execute(
+                    """
+                    INSERT INTO job_postings (
+                        id,
+                        title,
+                        description,
+                        company,
+                        location,
+                        apply_url,
+                        source_id,
+                        external_id,
+                        normalized_title,
+                        normalized_company,
+                        normalized_location,
+                        normalized_url,
+                        dedup_key,
+                        duplicate_hint_count,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title = excluded.title,
+                        description = excluded.description,
+                        company = excluded.company,
+                        location = excluded.location,
+                        apply_url = excluded.apply_url,
+                        source_id = excluded.source_id,
+                        external_id = excluded.external_id,
+                        normalized_title = excluded.normalized_title,
+                        normalized_company = excluded.normalized_company,
+                        normalized_location = excluded.normalized_location,
+                        normalized_url = excluded.normalized_url,
+                        dedup_key = excluded.dedup_key,
+                        duplicate_hint_count = excluded.duplicate_hint_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        posting.id,
+                        title,
+                        description,
+                        company,
+                        location,
+                        apply_url,
+                        source_id,
+                        external_id,
+                        normalized_title,
+                        normalized_company,
+                        normalized_location,
+                        normalized_url,
+                        dedup_key,
+                        duplicate_hint_count,
+                        now,
+                        now,
+                    ),
+                )
+
             self.connection.commit()
+            if return_stats:
+                return UpsertSummary(updated=len(postings), possible_duplicates=possible_duplicates)
             return len(postings)
 
     def list_postings(self, limit: int) -> list[StoredPosting]:
         with self._lock:
             cursor = self.connection.execute(
                 """
-                SELECT id, title, description, updated_at
+                SELECT
+                    id,
+                    title,
+                    description,
+                    company,
+                    location,
+                    apply_url,
+                    source_id,
+                    external_id,
+                    dedup_key,
+                    duplicate_hint_count,
+                    updated_at
                 FROM job_postings
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -402,13 +637,7 @@ class RecommenderRepository:
                     updated_at = ?
                 WHERE source_id = ?
                 """,
-                (
-                    scanned_at,
-                    status,
-                    error,
-                    now_utc_iso(),
-                    source_id,
-                ),
+                (scanned_at, status, error, now_utc_iso(), source_id),
             )
             self.connection.commit()
 
@@ -428,22 +657,101 @@ class RecommenderRepository:
         )
 
 
-def rank_postings(resume_text: str, postings: list[JobPosting]) -> list[RankedRecommendation]:
+def _token_overlap(reference: set[str], candidates: set[str]) -> float:
+    if not candidates:
+        return 0.0
+    return len(reference.intersection(candidates)) / len(candidates)
+
+
+def _freshness_bonus(updated_at: str | None) -> float:
+    updated = parse_iso_datetime(updated_at)
+    if updated is None:
+        return 0.0
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    age_hours = (datetime.now(UTC) - updated).total_seconds() / 3600
+    if age_hours <= 24:
+        return 0.06
+    if age_hours <= 72:
+        return 0.03
+    if age_hours <= 168:
+        return 0.01
+    return 0.0
+
+
+def rank_postings(
+    resume_text: str,
+    postings: list[JobPosting],
+    *,
+    preferred_keywords: list[str] | None = None,
+    preferred_locations: list[str] | None = None,
+    preferred_companies: list[str] | None = None,
+    remote_only: bool = False,
+) -> list[RankedRecommendation]:
     resume_tokens = tokenize(resume_text)
+    preferred_keyword_tokens = tokenize(" ".join(preferred_keywords or []))
+    preferred_locations_normalized = {normalize_text(value) for value in preferred_locations or []}
+    preferred_companies_normalized = {normalize_text(value) for value in preferred_companies or []}
+
     ranked: list[RankedRecommendation] = []
-
     for posting in postings:
-        job_tokens = tokenize(f"{posting.title} {posting.description}")
-        if not job_tokens:
-            score = 0.0
-        else:
-            score = len(resume_tokens.intersection(job_tokens)) / len(job_tokens)
+        title_tokens = tokenize(posting.title)
+        description_tokens = tokenize(posting.description)
+        company_tokens = tokenize(posting.company or "")
+        all_job_tokens = title_tokens.union(description_tokens).union(company_tokens)
 
+        title_overlap = _token_overlap(resume_tokens, title_tokens)
+        description_overlap = _token_overlap(resume_tokens, description_tokens)
+        keyword_overlap = _token_overlap(preferred_keyword_tokens, all_job_tokens)
+
+        preference_bonus = 0.0
+        normalized_company = normalize_text(posting.company or "")
+        normalized_location = normalize_text(posting.location or "")
+
+        if normalized_company and normalized_company in preferred_companies_normalized:
+            preference_bonus += 0.08
+        if normalized_location and normalized_location in preferred_locations_normalized:
+            preference_bonus += 0.08
+
+        remote_signal = "remote" in normalize_text(
+            f"{posting.location or ''} {posting.title} {posting.description}"
+        )
+        if remote_only:
+            preference_bonus += 0.08 if remote_signal else -0.05
+
+        freshness_bonus = _freshness_bonus(posting.updated_at)
+        duplicate_penalty = min(0.02 * posting.duplicate_hint_count, 0.08)
+
+        score = (
+            0.55 * title_overlap
+            + 0.35 * description_overlap
+            + 0.10 * keyword_overlap
+            + preference_bonus
+            + freshness_bonus
+            - duplicate_penalty
+        )
+        score = max(score, 0.0)
+        matched_terms = sorted(list(resume_tokens.intersection(all_job_tokens)))[:12]
+
+        breakdown = ScoreBreakdown(
+            title_overlap=round(title_overlap, 4),
+            description_overlap=round(description_overlap, 4),
+            preferred_keyword_overlap=round(keyword_overlap, 4),
+            preference_bonus=round(preference_bonus, 4),
+            freshness_bonus=round(freshness_bonus, 4),
+            duplicate_penalty=round(duplicate_penalty, 4),
+            final_score=round(score, 4),
+        )
         ranked.append(
             RankedRecommendation(
                 id=posting.id,
                 title=posting.title,
+                company=posting.company,
+                location=posting.location,
+                apply_url=posting.apply_url,
                 score=round(score, 4),
+                matched_terms=matched_terms,
+                score_breakdown=breakdown,
             )
         )
 
@@ -451,7 +759,12 @@ def rank_postings(resume_text: str, postings: list[JobPosting]) -> list[RankedRe
     return ranked
 
 
-def to_job_postings_from_payload(source_id: str, payload: Any) -> list[JobPosting]:
+def to_job_postings_from_payload(
+    source_id: str,
+    payload: Any,
+    *,
+    scanned_at: str,
+) -> list[JobPosting]:
     if isinstance(payload, dict):
         raw_postings = payload.get("postings", [])
     elif isinstance(payload, list):
@@ -463,21 +776,61 @@ def to_job_postings_from_payload(source_id: str, payload: Any) -> list[JobPostin
         raise ValueError("Source payload postings must be a list.")
 
     postings: list[JobPosting] = []
+    scan_marker = scanned_at.replace("-", "").replace(":", "").replace(".", "")
+
     for index, item in enumerate(raw_postings, start=1):
         if not isinstance(item, dict):
             continue
-        title = str(item.get("title", "")).strip()
-        description = str(item.get("description", "")).strip() or title
+        title = normalize_whitespace(str(item.get("title", "")).strip())
+        description = normalize_whitespace(str(item.get("description", "")).strip()) or title
+        company = normalize_whitespace(str(item.get("company", "")).strip()) or None
+        location = normalize_whitespace(str(item.get("location", "")).strip()) or None
+        apply_url = str(item.get("apply_url", "")).strip() or None
         if not title:
             continue
-        raw_id = item.get("id")
-        external_id = str(raw_id).strip() if raw_id is not None else ""
+
+        external_id_candidates = [item.get("external_id"), item.get("id")]
+        external_id = next(
+            (
+                str(value).strip()
+                for value in external_id_candidates
+                if value is not None and str(value).strip()
+            ),
+            None,
+        )
+
         if external_id:
-            posting_id = external_id
+            posting_id = f"{source_id}::{external_id}"
         else:
-            digest = hashlib.sha1(f"{source_id}|{title}|{description}".encode()).hexdigest()
-            posting_id = f"{source_id}-{index}-{digest[:10]}"
-        postings.append(JobPosting(id=posting_id, title=title, description=description))
+            base = "|".join(
+                [
+                    source_id,
+                    title,
+                    description,
+                    company or "",
+                    location or "",
+                    apply_url or "",
+                    str(index),
+                    scan_marker,
+                ]
+            )
+            digest = hashlib.sha1(base.encode()).hexdigest()
+            posting_id = f"{source_id}::{digest[:14]}"
+
+        postings.append(
+            JobPosting(
+                id=posting_id,
+                title=title,
+                description=description,
+                company=company,
+                location=location,
+                apply_url=apply_url,
+                source_id=source_id,
+                external_id=external_id,
+                updated_at=scanned_at,
+                dedup_key=build_dedup_key(title, company, location, apply_url),
+            )
+        )
     return postings
 
 
@@ -500,14 +853,15 @@ def scan_source(repository: RecommenderRepository, source: JobSource) -> JobSour
     scanned_at = now_utc_iso()
     try:
         payload = load_source_payload(source)
-        postings = to_job_postings_from_payload(source.source_id, payload)
-        ingested = repository.upsert_postings(postings)
+        postings = to_job_postings_from_payload(source.source_id, payload, scanned_at=scanned_at)
+        summary = repository.upsert_postings(postings, return_stats=True)
         result = JobSourceScanResult(
             source_id=source.source_id,
             scanned_at=scanned_at,
             status="ok",
             fetched=len(postings),
-            ingested=ingested,
+            ingested=summary.updated,
+            possible_duplicates=summary.possible_duplicates,
         )
         repository.update_job_source_scan_state(
             source.source_id,
@@ -530,6 +884,7 @@ def scan_source(repository: RecommenderRepository, source: JobSource) -> JobSour
             status="error",
             fetched=0,
             ingested=0,
+            possible_duplicates=0,
             error=error_text,
         )
 
@@ -553,7 +908,7 @@ def create_app(
         finally:
             await run_in_threadpool(repository.close)
 
-    app = FastAPI(title="OperationBattleship Recommender", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="OperationBattleship Recommender", version="0.4.0", lifespan=lifespan)
 
     def require_api_key(request: Request) -> None:
         expected = request.app.state.api_key
@@ -625,11 +980,7 @@ def create_app(
         )
         results: list[JobSourceScanResult] = []
         for source in sources:
-            result = await run_in_threadpool(
-                scan_source,
-                request.app.state.repository,
-                source,
-            )
+            result = await run_in_threadpool(scan_source, request.app.state.repository, source)
             results.append(result)
 
         return JobSourceScanBatchResponse(
@@ -638,6 +989,7 @@ def create_app(
             successful_sources=sum(1 for result in results if result.status == "ok"),
             failed_sources=sum(1 for result in results if result.status == "error"),
             total_ingested=sum(result.ingested for result in results),
+            possible_duplicates=sum(result.possible_duplicates for result in results),
             results=results,
         )
 
@@ -655,18 +1007,37 @@ def create_app(
         postings = payload.postings
         if not postings:
             source = "stored"
-            postings = await run_in_threadpool(
+            stored_postings = await run_in_threadpool(
                 request.app.state.repository.list_postings,
                 payload.max_postings,
             )
             postings = [
-                JobPosting(id=posting.id, title=posting.title, description=posting.description)
-                for posting in postings
+                JobPosting(
+                    id=posting.id,
+                    title=posting.title,
+                    description=posting.description,
+                    company=posting.company,
+                    location=posting.location,
+                    apply_url=posting.apply_url,
+                    source_id=posting.source_id,
+                    external_id=posting.external_id,
+                    dedup_key=posting.dedup_key,
+                    duplicate_hint_count=posting.duplicate_hint_count,
+                    updated_at=posting.updated_at,
+                )
+                for posting in stored_postings
             ]
         else:
             await run_in_threadpool(request.app.state.repository.upsert_postings, postings)
 
-        ranked = rank_postings(payload.resume_text, postings)
+        ranked = rank_postings(
+            payload.resume_text,
+            postings,
+            preferred_keywords=payload.preferred_keywords,
+            preferred_locations=payload.preferred_locations,
+            preferred_companies=payload.preferred_companies,
+            remote_only=payload.remote_only,
+        )
         run_id, generated_at = await run_in_threadpool(
             request.app.state.repository.record_recommendations,
             payload.resume_text,

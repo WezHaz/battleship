@@ -131,6 +131,12 @@ Local URLs:
 
 The recommender now persists scanned postings and recommendation history in SQLite.
 When running with Docker, the DB file is stored in the `recommender-data` volume.
+Each posting is normalized (title/company/location/url) and assigned a `dedup_key`.
+
+Dedup behavior is intentionally light:
+- if `source_id + external_id` is present, updates are applied to that same record
+- if external IDs are missing, scans keep separate rows (duplicates remain visible)
+- possible duplicates are surfaced via `duplicate_hint_count` instead of hard deletion
 
 ```bash
 # 1) Scan/store job postings
@@ -186,6 +192,19 @@ When a source scan runs:
 - postings are normalized and upserted into SQLite
 - source health is tracked (`last_scan_at`, `last_status`, `last_error`)
 - recommend calls can use stored postings with `"postings":[]`
+- source scan results also report `possible_duplicates`
+
+## Recommendation personalization
+
+`POST /recommend` accepts optional preference fields:
+- `preferred_keywords`
+- `preferred_locations`
+- `preferred_companies`
+- `remote_only`
+
+Response recommendations now include:
+- `matched_terms`
+- `score_breakdown` (title/description overlap, preference bonus, freshness bonus, duplicate penalty)
 
 ## Security hardening (current)
 
