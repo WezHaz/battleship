@@ -152,6 +152,46 @@ def test_proxy_profile_routes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert capture["method"] == "DELETE"
 
 
+def test_proxy_list_sources_defaults_to_all_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    capture: dict[str, Any] = {}
+    upstream_payload = [{"source_id": "demo", "enabled": True}]
+    response = StubResponse(status_code=200, payload=upstream_payload)
+    monkeypatch.setattr(
+        frontend_main.httpx,
+        "AsyncClient",
+        lambda *_, **__: StubAsyncClient(response=response, capture=capture),
+    )
+
+    with TestClient(frontend_main.app) as client:
+        proxy_response = client.get("/api/sources")
+
+    body = proxy_response.json()
+    assert proxy_response.status_code == 200
+    assert body["recommender_response"] == upstream_payload
+    assert capture["method"] == "GET"
+    assert capture["url"].endswith("/job-sources?enabled_only=false")
+
+
+def test_proxy_scan_one_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    capture: dict[str, Any] = {}
+    upstream_payload = {"source_id": "demo", "status": "ok", "ingested": 2}
+    response = StubResponse(status_code=200, payload=upstream_payload)
+    monkeypatch.setattr(
+        frontend_main.httpx,
+        "AsyncClient",
+        lambda *_, **__: StubAsyncClient(response=response, capture=capture),
+    )
+
+    with TestClient(frontend_main.app) as client:
+        proxy_response = client.post("/api/scan/sources/demo")
+
+    body = proxy_response.json()
+    assert proxy_response.status_code == 200
+    assert body["recommender_response"] == upstream_payload
+    assert capture["method"] == "POST"
+    assert capture["url"].endswith("/job-sources/demo/scan")
+
+
 def test_proxy_scan_wraps_upstream_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     capture: dict[str, Any] = {}
     upstream_payload = {"updated": 2}

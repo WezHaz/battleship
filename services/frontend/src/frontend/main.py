@@ -166,10 +166,20 @@ async def index() -> str:
       </div>
     </div>
 
+    <div class=\"panel\">
+      <h2>Source Scan Panel</h2>
+      <label><input type=\"checkbox\" id=\"sources_enabled_only\" /> Enabled Only</label>
+      <button onclick=\"loadSources()\">Load Sources</button>
+      <button onclick=\"scanConfiguredSources()\">Scan All Sources</button>
+      <div id=\"sources_list\"></div>
+    </div>
+
     <h2>Response</h2>
     <pre id=\"output\"></pre>
 
     <script>
+      let sourceCache = [];
+
       function parseCsv(value) {
         return value
           .split(',')
@@ -208,6 +218,57 @@ async def index() -> str:
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
       }
 
+      function escapeHtml(value) {
+        return value
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;');
+      }
+
+      function renderSources() {
+        const container = document.getElementById('sources_list');
+        if (!sourceCache.length) {
+          container.innerHTML = '<p>No sources found.</p>';
+          return;
+        }
+
+        const rows = sourceCache.map(source => {
+          const sourceId = escapeHtml(source.source_id);
+          const name = escapeHtml(source.name || source.source_id);
+          const status = escapeHtml(source.last_status || 'unknown');
+          const enabled = source.enabled ? 'yes' : 'no';
+          const error = escapeHtml(source.last_error || '');
+          return `
+            <tr>
+              <td>${sourceId}</td>
+              <td>${name}</td>
+              <td>${enabled}</td>
+              <td>${status}</td>
+              <td>${error}</td>
+              <td><button onclick="scanOneSource('${sourceId}')">Scan</button></td>
+            </tr>
+          `;
+        }).join('');
+
+        container.innerHTML = `
+          <table style="width:100%; border-collapse:collapse; margin-top:0.6rem;">
+            <thead>
+              <tr>
+                <th align="left">Source ID</th>
+                <th align="left">Name</th>
+                <th align="left">Enabled</th>
+                <th align="left">Last Status</th>
+                <th align="left">Last Error</th>
+                <th align="left">Action</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        `;
+      }
+
       function readProfilePayload() {
         return {
           profile_id: document.getElementById('profile_id').value.trim(),
@@ -230,6 +291,21 @@ async def index() -> str:
         writeOutput(data);
       }
 
+      async function loadSources() {
+        const enabledOnly = document.getElementById('sources_enabled_only').checked;
+        const query = enabledOnly ? 'true' : 'false';
+        const data = await callApi(`/api/sources?enabled_only=${query}`, 'GET');
+        sourceCache = data.recommender_response || [];
+        renderSources();
+        writeOutput(data);
+      }
+
+      async function scanOneSource(sourceId) {
+        const data = await callApi(`/api/scan/sources/${sourceId}`, 'POST', {});
+        writeOutput(data);
+        await loadSources();
+      }
+
       async function deleteProfile() {
         const profileId = document.getElementById('profile_id').value.trim();
         if (!profileId) throw new Error('Profile ID is required for delete.');
@@ -246,6 +322,7 @@ async def index() -> str:
       async function scanConfiguredSources() {
         const data = await callApi('/api/scan/sources', 'POST', { enabled_only: true });
         writeOutput(data);
+        await loadSources();
       }
 
       async function submitData() {
@@ -275,7 +352,10 @@ async def index() -> str:
           remote_only: readRemoteOnly()
         });
         writeOutput({ scan: scanData, recommend: recommendData });
+        await loadSources();
       }
+
+      loadSources();
     </script>
   </body>
 </html>
@@ -296,6 +376,17 @@ async def proxy_scan_sources(payload: UISourceScanRequest) -> dict[str, Any]:
         f"/job-sources/scan?enabled_only={enabled_only}",
         {},
     )
+
+
+@app.get("/api/sources")
+async def proxy_list_sources(enabled_only: bool = False) -> dict[str, Any]:
+    bool_value = "true" if enabled_only else "false"
+    return await request_to_recommender("GET", f"/job-sources?enabled_only={bool_value}")
+
+
+@app.post("/api/scan/sources/{source_id}")
+async def proxy_scan_one_source(source_id: str) -> dict[str, Any]:
+    return await request_to_recommender("POST", f"/job-sources/{source_id}/scan", {})
 
 
 @app.post("/api/profiles")

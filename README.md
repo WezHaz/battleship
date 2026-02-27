@@ -58,6 +58,8 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /`
   - `POST /api/scan`
   - `POST /api/scan/sources`
+  - `POST /api/scan/sources/{source_id}`
+  - `GET /api/sources`
   - `POST /api/profiles`
   - `GET /api/profiles`
   - `DELETE /api/profiles/{profile_id}`
@@ -183,6 +185,7 @@ The frontend UI now supports profile + scan + recommend actions in one screen:
 - `Save Profile`/`Load Profiles`/`Delete Profile`
 - `Scan Postings` -> stores postings in recommender persistence
 - `Scan Configured Sources` -> runs all enabled `job_sources`
+- `Source Scan Panel` -> defaults to listing all sources, supports per-source scan and optional enabled-only filter
 - `Get Recommendations` -> recommends from the current textarea postings
 - `Scan + Recommend` -> stores postings, then recommends using stored postings
 
