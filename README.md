@@ -37,7 +37,10 @@ OperationBattleship is a Python microservices job-search platform scaffold using
 
 - `recommender`: FastAPI recommendation API
   - `GET /health`
+  - `POST /postings`
+  - `GET /postings`
   - `POST /recommend`
+  - `GET /recommendations/history`
 - `frontend`: FastAPI gateway + simple UI
   - `GET /`
   - `POST /api/recommend`
@@ -117,6 +120,34 @@ Local URLs:
 - Frontend UI: `http://localhost:8000`
 - Recommender docs: `http://localhost:8001/docs`
 - Emailer docs: `http://localhost:8002/docs`
+
+## Recommender persistence flow
+
+The recommender now persists scanned postings and recommendation history in SQLite.
+When running with Docker, the DB file is stored in the `recommender-data` volume.
+
+```bash
+# 1) Scan/store job postings
+curl -X POST http://localhost:8001/postings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "postings": [
+      {"id":"job-1","title":"Backend Engineer","description":"Build Python APIs"},
+      {"id":"job-2","title":"Data Engineer","description":"Build ETL pipelines"}
+    ]
+  }'
+
+# 2) Recommend against stored postings (empty postings list => use DB)
+curl -X POST http://localhost:8001/recommend \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resume_text":"Python backend engineer building API systems",
+    "postings":[]
+  }'
+
+# 3) Inspect history
+curl http://localhost:8001/recommendations/history
+```
 
 ## Terraform IaC
 

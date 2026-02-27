@@ -5,10 +5,13 @@ services:
       dockerfile: services/recommender/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://battleship:battleship@postgres:5432/battleship}
+      RECOMMENDER_DB_PATH: ${RECOMMENDER_DB_PATH:-/var/lib/operation-battleship/recommender.sqlite3}
     depends_on:
       - postgres
     ports:
       - "8001:8001"
+    volumes:
+      - recommender-data:/var/lib/operation-battleship
 
   frontend:
     build:
@@ -46,3 +49,4 @@ services:
 
 volumes:
   postgres-data:
+  recommender-data:
