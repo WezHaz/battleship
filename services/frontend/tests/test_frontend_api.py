@@ -189,7 +189,7 @@ def test_proxy_scan_one_source(monkeypatch: pytest.MonkeyPatch) -> None:
     assert proxy_response.status_code == 200
     assert body["recommender_response"] == upstream_payload
     assert capture["method"] == "POST"
-    assert capture["url"].endswith("/job-sources/demo/scan")
+    assert capture["url"].endswith("/job-sources/demo/scan?respect_backoff=false")
 
 
 def test_proxy_scan_wraps_upstream_payload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -241,7 +241,51 @@ def test_proxy_scan_sources_wraps_upstream_payload(monkeypatch: pytest.MonkeyPat
     assert proxy_response.status_code == 200
     assert "gateway_generated_at" in body
     assert body["recommender_response"] == upstream_payload
-    assert capture["url"].endswith("/job-sources/scan?enabled_only=true")
+    assert capture["url"].endswith("/job-sources/scan?enabled_only=true&respect_backoff=false")
+
+
+def test_proxy_scan_sources_scheduled_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    capture: dict[str, Any] = {}
+    upstream_payload = {"requested_sources": 1, "successful_sources": 1, "results": []}
+    response = StubResponse(status_code=200, payload=upstream_payload)
+    monkeypatch.setattr(
+        frontend_main.httpx,
+        "AsyncClient",
+        lambda *_, **__: StubAsyncClient(response=response, capture=capture),
+    )
+
+    with TestClient(frontend_main.app) as client:
+        proxy_response = client.post(
+            "/api/scan/sources",
+            json={"enabled_only": False, "trigger": "scheduled", "respect_backoff": False},
+        )
+
+    body = proxy_response.json()
+    assert proxy_response.status_code == 200
+    assert body["recommender_response"] == upstream_payload
+    assert capture["url"].endswith("/job-sources/scan/scheduled?enabled_only=false")
+
+
+def test_proxy_scan_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    capture: dict[str, Any] = {}
+    upstream_payload = [{"source_id": "demo", "status": "ok"}]
+    response = StubResponse(status_code=200, payload=upstream_payload)
+    monkeypatch.setattr(
+        frontend_main.httpx,
+        "AsyncClient",
+        lambda *_, **__: StubAsyncClient(response=response, capture=capture),
+    )
+
+    with TestClient(frontend_main.app) as client:
+        proxy_response = client.get("/api/scan/history?limit=10&source_id=demo&trigger=manual")
+
+    body = proxy_response.json()
+    assert proxy_response.status_code == 200
+    assert body["recommender_response"] == upstream_payload
+    assert capture["method"] == "GET"
+    assert capture["url"].endswith(
+        "/job-sources/scan-history?limit=10&source_id=demo&trigger=manual"
+    )
 
 
 def test_proxy_scan_sources_maps_upstream_errors(monkeypatch: pytest.MonkeyPatch) -> None:

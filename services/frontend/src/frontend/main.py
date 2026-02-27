@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from common.utils import now_utc_iso
@@ -30,6 +30,8 @@ class UIScanRequest(BaseModel):
 
 class UISourceScanRequest(BaseModel):
     enabled_only: bool = True
+    trigger: Literal["manual", "scheduled"] = "manual"
+    respect_backoff: bool = False
 
 
 class UIProfileUpsertRequest(BaseModel):
@@ -169,8 +171,17 @@ async def index() -> str:
     <div class=\"panel\">
       <h2>Source Scan Panel</h2>
       <label><input type=\"checkbox\" id=\"sources_enabled_only\" /> Enabled Only</label>
+      <label>Scan Trigger</label>
+      <select id=\"source_scan_trigger\">
+        <option value=\"manual\">Manual</option>
+        <option value=\"scheduled\">Scheduled</option>
+      </select>
+      <label><input type=\"checkbox\" id=\"source_scan_backoff\" /> Respect Backoff</label>
+      <label>History Source Filter (optional)</label>
+      <input id=\"scan_history_source_id\" placeholder=\"source_id\" />
       <button onclick=\"loadSources()\">Load Sources</button>
       <button onclick=\"scanConfiguredSources()\">Scan All Sources</button>
+      <button onclick=\"loadScanHistory()\">Load Scan History</button>
       <div id=\"sources_list\"></div>
     </div>
 
@@ -199,6 +210,17 @@ async def index() -> str:
         if (mode === 'true') return true;
         if (mode === 'false') return false;
         return null;
+      }
+
+      function readSourceScanOptions() {
+        const enabledOnly = document.getElementById('sources_enabled_only').checked;
+        const trigger = document.getElementById('source_scan_trigger').value;
+        const respectBackoff = document.getElementById('source_scan_backoff').checked;
+        return {
+          enabled_only: enabledOnly,
+          trigger,
+          respect_backoff: trigger === 'scheduled' ? true : respectBackoff
+        };
       }
 
       async function callApi(path, method, payload = null) {
@@ -239,6 +261,10 @@ async def index() -> str:
           const name = escapeHtml(source.name || source.source_id);
           const status = escapeHtml(source.last_status || 'unknown');
           const enabled = source.enabled ? 'yes' : 'no';
+          const failures = Number.isInteger(source.consecutive_failures)
+            ? String(source.consecutive_failures)
+            : '0';
+          const nextEligible = escapeHtml(source.next_eligible_scan_at || '-');
           const error = escapeHtml(source.last_error || '');
           return `
             <tr>
@@ -246,6 +272,8 @@ async def index() -> str:
               <td>${name}</td>
               <td>${enabled}</td>
               <td>${status}</td>
+              <td>${failures}</td>
+              <td>${nextEligible}</td>
               <td>${error}</td>
               <td><button onclick="scanOneSource('${sourceId}')">Scan</button></td>
             </tr>
@@ -260,6 +288,8 @@ async def index() -> str:
                 <th align="left">Name</th>
                 <th align="left">Enabled</th>
                 <th align="left">Last Status</th>
+                <th align="left">Failures</th>
+                <th align="left">Next Eligible Scan</th>
                 <th align="left">Last Error</th>
                 <th align="left">Action</th>
               </tr>
@@ -301,7 +331,13 @@ async def index() -> str:
       }
 
       async function scanOneSource(sourceId) {
-        const data = await callApi(`/api/scan/sources/${sourceId}`, 'POST', {});
+        const options = readSourceScanOptions();
+        const backoff = options.respect_backoff ? 'true' : 'false';
+        const data = await callApi(
+          `/api/scan/sources/${sourceId}?respect_backoff=${backoff}`,
+          'POST',
+          {}
+        );
         writeOutput(data);
         await loadSources();
       }
@@ -320,9 +356,20 @@ async def index() -> str:
       }
 
       async function scanConfiguredSources() {
-        const data = await callApi('/api/scan/sources', 'POST', { enabled_only: true });
+        const data = await callApi('/api/scan/sources', 'POST', readSourceScanOptions());
         writeOutput(data);
         await loadSources();
+      }
+
+      async function loadScanHistory() {
+        const sourceId = document.getElementById('scan_history_source_id').value.trim();
+        const trigger = document.getElementById('source_scan_trigger').value;
+        const params = new URLSearchParams();
+        params.set('limit', '50');
+        params.set('trigger', trigger);
+        if (sourceId) params.set('source_id', sourceId);
+        const data = await callApi(`/api/scan/history?${params.toString()}`, 'GET');
+        writeOutput(data);
       }
 
       async function submitData() {
@@ -371,9 +418,19 @@ async def proxy_scan(payload: UIScanRequest) -> dict[str, Any]:
 @app.post("/api/scan/sources")
 async def proxy_scan_sources(payload: UISourceScanRequest) -> dict[str, Any]:
     enabled_only = "true" if payload.enabled_only else "false"
+    respect_backoff = "true" if payload.respect_backoff else "false"
+    if payload.trigger == "scheduled":
+        return await request_to_recommender(
+            "POST",
+            f"/job-sources/scan/scheduled?enabled_only={enabled_only}",
+            {},
+        )
     return await request_to_recommender(
         "POST",
-        f"/job-sources/scan?enabled_only={enabled_only}",
+        (
+            "/job-sources/scan"
+            f"?enabled_only={enabled_only}&respect_backoff={respect_backoff}"
+        ),
         {},
     )
 
@@ -385,8 +442,31 @@ async def proxy_list_sources(enabled_only: bool = False) -> dict[str, Any]:
 
 
 @app.post("/api/scan/sources/{source_id}")
-async def proxy_scan_one_source(source_id: str) -> dict[str, Any]:
-    return await request_to_recommender("POST", f"/job-sources/{source_id}/scan", {})
+async def proxy_scan_one_source(
+    source_id: str,
+    respect_backoff: bool = False,
+) -> dict[str, Any]:
+    backoff_value = "true" if respect_backoff else "false"
+    return await request_to_recommender(
+        "POST",
+        f"/job-sources/{source_id}/scan?respect_backoff={backoff_value}",
+        {},
+    )
+
+
+@app.get("/api/scan/history")
+async def proxy_scan_history(
+    limit: int = 50,
+    source_id: str | None = None,
+    trigger: Literal["manual", "scheduled"] | None = None,
+) -> dict[str, Any]:
+    query_parts = [f"limit={limit}"]
+    if source_id:
+        query_parts.append(f"source_id={source_id}")
+    if trigger:
+        query_parts.append(f"trigger={trigger}")
+    query = "&".join(query_parts)
+    return await request_to_recommender("GET", f"/job-sources/scan-history?{query}")
 
 
 @app.post("/api/profiles")

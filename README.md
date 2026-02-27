@@ -61,6 +61,7 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `POST /api/scan`
   - `POST /api/scan/sources`
   - `POST /api/scan/sources/{source_id}`
+  - `GET /api/scan/history`
   - `GET /api/sources`
   - `POST /api/profiles`
   - `GET /api/profiles`
@@ -125,6 +126,11 @@ uv run pytest -m integration
 uv run pytest -m bdd
 ```
 
+Optional dependency note:
+- emailer tests require `email-validator` (`pydantic[email]` extras)
+- if missing, emailer-related test collection is skipped via top-level `conftest.py`
+- this keeps core recommender/frontend validation unblocked while emailer remains secondary
+
 ## Run locally
 
 ```bash
@@ -187,7 +193,7 @@ The frontend UI now supports profile + scan + recommend actions in one screen:
 - `Save Profile`/`Load Profiles`/`Delete Profile`
 - `Scan Postings` -> stores postings in recommender persistence
 - `Scan Configured Sources` -> runs all enabled `job_sources`
-- `Source Scan Panel` -> defaults to listing all sources, supports per-source scan and optional enabled-only filter
+- `Source Scan Panel` -> defaults to listing all sources, supports manual/scheduled trigger, optional backoff, per-source scan, and scan history lookup
 - `Get Recommendations` -> recommends from the current textarea postings
 - `Scan + Recommend` -> stores postings, then recommends using stored postings
 
