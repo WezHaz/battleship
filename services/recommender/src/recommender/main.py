@@ -5,13 +5,14 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from urllib import request as urllib_request
@@ -107,6 +108,14 @@ def parse_api_tokens(raw: str) -> dict[str, set[str]]:
 def build_auth_subject(token: str) -> str:
     token_digest = hashlib.sha1(token.encode()).hexdigest()[:12]
     return f"token:{token_digest}"
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def normalize_scopes(scopes: list[str] | set[str]) -> list[str]:
+    return sorted({scope.strip() for scope in scopes if scope.strip()})
 
 
 class JobPosting(BaseModel):
@@ -320,6 +329,48 @@ class AuditEvent(BaseModel):
     message: str | None = None
 
 
+class ApiTokenCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    scopes: list[str] = Field(default_factory=list)
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+    expires_at: str | None = None
+    notes: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_expiry(self) -> ApiTokenCreateRequest:
+        if self.expires_at:
+            parsed = parse_iso_datetime(self.expires_at)
+            if parsed is None:
+                raise ValueError("expires_at must be an ISO-8601 datetime string.")
+        return self
+
+
+class ApiTokenMetadata(BaseModel):
+    token_id: str
+    name: str
+    scopes: list[str]
+    created_at: str
+    updated_at: str
+    expires_at: str | None
+    revoked_at: str | None
+    last_used_at: str | None
+    last_used_ip: str | None
+    last_used_user_agent: str | None
+    notes: str | None
+    active: bool
+
+
+class ApiTokenCreateResponse(BaseModel):
+    token: str
+    metadata: ApiTokenMetadata
+
+
+class TokenAuthContext(BaseModel):
+    scopes: set[str]
+    auth_subject: str
+    token_id: str | None = None
+
+
 class MetricsSnapshot(BaseModel):
     generated_at: str
     totals: dict[str, int]
@@ -442,6 +493,21 @@ class RecommenderRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS api_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    scopes_json TEXT NOT NULL,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    revoked_at TEXT,
+                    last_used_at TEXT,
+                    last_used_ip TEXT,
+                    last_used_user_agent TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     occurred_at TEXT NOT NULL,
@@ -460,6 +526,7 @@ class RecommenderRepository:
             )
             self._ensure_job_postings_columns()
             self._ensure_audit_events_columns()
+            self._ensure_api_tokens_columns()
             self._connection.commit()
 
     def _ensure_job_postings_columns(self) -> None:
@@ -491,6 +558,23 @@ class RecommenderRepository:
         existing = {row["name"] for row in column_rows}
         if "request_id" not in existing:
             self.connection.execute("ALTER TABLE audit_events ADD COLUMN request_id TEXT")
+
+    def _ensure_api_tokens_columns(self) -> None:
+        column_rows = self.connection.execute("PRAGMA table_info(api_tokens)").fetchall()
+        existing = {row["name"] for row in column_rows}
+        required_definitions = {
+            "notes": "TEXT",
+            "revoked_at": "TEXT",
+            "last_used_at": "TEXT",
+            "last_used_ip": "TEXT",
+            "last_used_user_agent": "TEXT",
+        }
+        for column_name, definition in required_definitions.items():
+            if column_name in existing:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE api_tokens ADD COLUMN {column_name} {definition}"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -863,6 +947,204 @@ class RecommenderRepository:
             self.connection.commit()
             return cursor.rowcount > 0
 
+    def has_active_api_tokens(self) -> bool:
+        with self._lock:
+            now = now_utc_iso()
+            count = int(
+                self.connection.execute(
+                    """
+                    SELECT COUNT(1) AS c
+                    FROM api_tokens
+                    WHERE revoked_at IS NULL
+                      AND (expires_at IS NULL OR expires_at > ?)
+                    """,
+                    (now,),
+                ).fetchone()["c"]
+            )
+            return count > 0
+
+    def create_api_token(self, payload: ApiTokenCreateRequest) -> ApiTokenCreateResponse:
+        with self._lock:
+            now = now_utc_iso()
+            token_id = str(uuid.uuid4())
+            raw_token = f"obs_{secrets.token_urlsafe(32)}"
+            token_hash = hash_token(raw_token)
+            scopes = normalize_scopes(payload.scopes)
+            expires_at: str | None = None
+            if payload.expires_at:
+                parsed = parse_iso_datetime(payload.expires_at)
+                if parsed is None:
+                    raise ValueError("expires_at must be a valid ISO-8601 datetime.")
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                expires_at = parsed.astimezone(UTC).isoformat()
+            elif payload.expires_in_days:
+                expires = datetime.now(UTC) + timedelta(days=payload.expires_in_days)
+                expires_at = expires.isoformat()
+
+            self.connection.execute(
+                """
+                INSERT INTO api_tokens (
+                    token_id,
+                    token_hash,
+                    name,
+                    scopes_json,
+                    notes,
+                    created_at,
+                    updated_at,
+                    expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token_id,
+                    token_hash,
+                    payload.name,
+                    json.dumps(scopes),
+                    payload.notes,
+                    now,
+                    now,
+                    expires_at,
+                ),
+            )
+            self.connection.commit()
+            metadata = self.get_api_token_or_raise(token_id)
+            return ApiTokenCreateResponse(token=raw_token, metadata=metadata)
+
+    def get_api_token_or_raise(self, token_id: str) -> ApiTokenMetadata:
+        token = self.get_api_token(token_id)
+        if token is None:
+            raise KeyError(f"Unknown token_id: {token_id}")
+        return token
+
+    def get_api_token(self, token_id: str) -> ApiTokenMetadata | None:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT
+                    token_id,
+                    name,
+                    scopes_json,
+                    notes,
+                    created_at,
+                    updated_at,
+                    expires_at,
+                    revoked_at,
+                    last_used_at,
+                    last_used_ip,
+                    last_used_user_agent
+                FROM api_tokens
+                WHERE token_id = ?
+                """,
+                (token_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._to_api_token_metadata(row)
+
+    def list_api_tokens(self, *, include_revoked: bool) -> list[ApiTokenMetadata]:
+        with self._lock:
+            if include_revoked:
+                cursor = self.connection.execute(
+                    """
+                    SELECT
+                        token_id,
+                        name,
+                        scopes_json,
+                        notes,
+                        created_at,
+                        updated_at,
+                        expires_at,
+                        revoked_at,
+                        last_used_at,
+                        last_used_ip,
+                        last_used_user_agent
+                    FROM api_tokens
+                    ORDER BY created_at DESC
+                    """
+                )
+            else:
+                cursor = self.connection.execute(
+                    """
+                    SELECT
+                        token_id,
+                        name,
+                        scopes_json,
+                        notes,
+                        created_at,
+                        updated_at,
+                        expires_at,
+                        revoked_at,
+                        last_used_at,
+                        last_used_ip,
+                        last_used_user_agent
+                    FROM api_tokens
+                    WHERE revoked_at IS NULL
+                    ORDER BY created_at DESC
+                    """
+                )
+            return [self._to_api_token_metadata(row) for row in cursor.fetchall()]
+
+    def revoke_api_token(self, token_id: str) -> bool:
+        with self._lock:
+            now = now_utc_iso()
+            cursor = self.connection.execute(
+                """
+                UPDATE api_tokens
+                SET revoked_at = ?, updated_at = ?
+                WHERE token_id = ? AND revoked_at IS NULL
+                """,
+                (now, now, token_id),
+            )
+            self.connection.commit()
+            return cursor.rowcount > 0
+
+    def resolve_db_token(self, token_value: str) -> TokenAuthContext | None:
+        with self._lock:
+            now = now_utc_iso()
+            token_hash = hash_token(token_value)
+            row = self.connection.execute(
+                """
+                SELECT token_id, scopes_json
+                FROM api_tokens
+                WHERE token_hash = ?
+                  AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (token_hash, now),
+            ).fetchone()
+            if row is None:
+                return None
+            scopes = set(json.loads(row["scopes_json"]))
+            return TokenAuthContext(
+                scopes=scopes,
+                auth_subject=f"db-token:{row['token_id']}",
+                token_id=row["token_id"],
+            )
+
+    def touch_api_token_usage(
+        self,
+        token_id: str,
+        *,
+        source_ip: str | None,
+        user_agent: str | None,
+    ) -> None:
+        with self._lock:
+            now = now_utc_iso()
+            self.connection.execute(
+                """
+                UPDATE api_tokens
+                SET
+                    last_used_at = ?,
+                    last_used_ip = ?,
+                    last_used_user_agent = ?,
+                    updated_at = ?
+                WHERE token_id = ?
+                """,
+                (now, source_ip, user_agent, now, token_id),
+            )
+            self.connection.commit()
+
     def record_audit_event(
         self,
         *,
@@ -1000,6 +1282,27 @@ class RecommenderRepository:
             remote_only=bool(config.get("remote_only", False)),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    def _to_api_token_metadata(self, row: sqlite3.Row) -> ApiTokenMetadata:
+        scopes = json.loads(row["scopes_json"])
+        now = now_utc_iso()
+        expires_at = row["expires_at"]
+        revoked_at = row["revoked_at"]
+        active = revoked_at is None and (expires_at is None or expires_at > now)
+        return ApiTokenMetadata(
+            token_id=row["token_id"],
+            name=row["name"],
+            scopes=scopes,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            expires_at=expires_at,
+            revoked_at=revoked_at,
+            last_used_at=row["last_used_at"],
+            last_used_ip=row["last_used_ip"],
+            last_used_user_agent=row["last_used_user_agent"],
+            notes=row["notes"],
+            active=active,
         )
 
 
@@ -1262,7 +1565,11 @@ def create_app(
     resolved_token_map: dict[str, set[str]] = {}
     if api_tokens is not None:
         resolved_token_map = {
-            token: {str(scope).strip() for scope in scopes if str(scope).strip()}
+            token: set(
+                normalize_scopes(
+                    {str(scope).strip() for scope in scopes if str(scope).strip()}
+                )
+            )
             for token, scopes in api_tokens.items()
             if token.strip()
         }
@@ -1287,7 +1594,7 @@ def create_app(
         finally:
             await run_in_threadpool(repository.close)
 
-    app = FastAPI(title="OperationBattleship Recommender", version="0.5.0", lifespan=lifespan)
+    app = FastAPI(title="OperationBattleship Recommender", version="0.6.0", lifespan=lifespan)
 
     async def write_audit_event(
         request: Request,
@@ -1380,21 +1687,55 @@ def create_app(
         scope: str,
     ) -> str | None:
         token_map: dict[str, set[str]] = request.app.state.auth_token_scopes
-        if not token_map:
-            return None
         provided = request.headers.get("x-api-key", "")
-        scopes = token_map.get(provided)
-        if not provided or scopes is None:
+        has_env_tokens = bool(token_map)
+        has_db_tokens = await run_in_threadpool(request.app.state.repository.has_active_api_tokens)
+        auth_configured = has_env_tokens or has_db_tokens
+        if not auth_configured:
+            return None
+        if not provided:
             await write_audit_event(
                 request,
                 action=action,
                 scope=scope,
                 status="unauthorized",
-                message="missing or invalid api key",
+                message="missing api key",
             )
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-        auth_subject = build_auth_subject(provided)
+        token_context: TokenAuthContext | None = None
+        env_scopes = token_map.get(provided)
+        if env_scopes is not None:
+            token_context = TokenAuthContext(
+                scopes=env_scopes,
+                auth_subject=build_auth_subject(provided),
+            )
+        else:
+            token_context = await run_in_threadpool(
+                request.app.state.repository.resolve_db_token,
+                provided,
+            )
+
+        if token_context is None:
+            await write_audit_event(
+                request,
+                action=action,
+                scope=scope,
+                status="unauthorized",
+                message="invalid, expired, or revoked api key",
+            )
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        if token_context.token_id:
+            await run_in_threadpool(
+                request.app.state.repository.touch_api_token_usage,
+                token_context.token_id,
+                source_ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+            )
+
+        auth_subject = token_context.auth_subject
+        scopes = token_context.scopes
         if "*" not in scopes and scope not in scopes:
             await write_audit_event(
                 request,
@@ -1644,6 +1985,89 @@ def create_app(
         )
         response.headers["x-audit-event-id"] = str(event_id)
         return {"deleted": True}
+
+    @app.post("/auth/tokens", response_model=ApiTokenCreateResponse)
+    async def create_token(
+        payload: ApiTokenCreateRequest,
+        request: Request,
+        response: Response,
+    ) -> ApiTokenCreateResponse:
+        auth_subject = await require_scope(
+            request,
+            action="token_create",
+            scope="tokens:write",
+        )
+        token = await run_in_threadpool(request.app.state.repository.create_api_token, payload)
+        event_id = await write_audit_event(
+            request,
+            action="token_create",
+            scope="tokens:write",
+            status="ok",
+            message=f"token_id={token.metadata.token_id}; scopes={','.join(token.metadata.scopes)}",
+            auth_subject=auth_subject,
+        )
+        response.headers["x-audit-event-id"] = str(event_id)
+        return token
+
+    @app.get("/auth/tokens", response_model=list[ApiTokenMetadata])
+    async def list_tokens(
+        request: Request,
+        response: Response,
+        include_revoked: bool = Query(default=False),
+    ) -> list[ApiTokenMetadata]:
+        auth_subject = await require_scope(
+            request,
+            action="token_list",
+            scope="tokens:read",
+        )
+        tokens = await run_in_threadpool(
+            request.app.state.repository.list_api_tokens,
+            include_revoked=include_revoked,
+        )
+        event_id = await write_audit_event(
+            request,
+            action="token_list",
+            scope="tokens:read",
+            status="ok",
+            message=f"returned={len(tokens)}",
+            auth_subject=auth_subject,
+        )
+        response.headers["x-audit-event-id"] = str(event_id)
+        return tokens
+
+    @app.post("/auth/tokens/{token_id}/revoke")
+    async def revoke_token(
+        token_id: str,
+        request: Request,
+        response: Response,
+    ) -> dict[str, bool]:
+        auth_subject = await require_scope(
+            request,
+            action="token_revoke",
+            scope="tokens:write",
+        )
+        revoked = await run_in_threadpool(request.app.state.repository.revoke_api_token, token_id)
+        if not revoked:
+            event_id = await write_audit_event(
+                request,
+                action="token_revoke",
+                scope="tokens:write",
+                status="not_found",
+                message=f"token_id={token_id}",
+                auth_subject=auth_subject,
+            )
+            response.headers["x-audit-event-id"] = str(event_id)
+            raise HTTPException(status_code=404, detail="Unknown token_id")
+        event_id = await write_audit_event(
+            request,
+            action="token_revoke",
+            scope="tokens:write",
+            status="ok",
+            message=f"token_id={token_id}",
+            auth_subject=auth_subject,
+        )
+        response.headers["x-audit-event-id"] = str(event_id)
+        return {"revoked": True}
 
     @app.get("/audit-events", response_model=list[AuditEvent])
     async def list_audit_events(

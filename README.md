@@ -47,6 +47,9 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /profiles`
   - `GET /profiles/{profile_id}`
   - `DELETE /profiles/{profile_id}`
+  - `POST /auth/tokens`
+  - `GET /auth/tokens`
+  - `POST /auth/tokens/{token_id}/revoke`
   - `GET /audit-events`
   - `GET /metrics`
   - `POST /recommend`
@@ -249,6 +252,9 @@ Set `RECOMMENDER_API_KEY` to protect write endpoints:
 - `POST /profiles`
 - `DELETE /profiles/{profile_id}`
 - `GET /audit-events`
+- `POST /auth/tokens`
+- `GET /auth/tokens`
+- `POST /auth/tokens/{token_id}/revoke`
 
 When enabled, send the key in `x-api-key`.  
 The frontend forwards this header automatically when `RECOMMENDER_API_KEY` is configured for the frontend service too.
@@ -273,6 +279,8 @@ Scope usage:
 - `scan` for source scans
 - `profiles:write` for profile create/delete
 - `audit:read` for audit event access
+- `tokens:write` for token create/revoke
+- `tokens:read` for token metadata listing
 
 Audit events are recorded for protected actions with:
 - endpoint method/path
@@ -282,6 +290,31 @@ Audit events are recorded for protected actions with:
 - source IP/user agent
 - auth subject fingerprint
 - status (`ok`, `unauthorized`, `forbidden`, `not_found`, `error`)
+
+### Token lifecycle architecture decision (hybrid model)
+
+This project uses a hybrid token lifecycle model:
+- **primary:** SQLite-backed managed API tokens (`/auth/tokens` endpoints)
+- **fallback:** env bootstrap token (`RECOMMENDER_API_KEY`) for emergency recovery and first-time setup
+
+Why this decision was made (robustness + reliability):
+1. **Safe rotation without downtime**
+   - DB-managed tokens can be created before old tokens are revoked.
+   - Humans and AI agents can migrate gradually to new tokens.
+2. **Immediate revocation**
+   - Compromised tokens can be revoked instantly in SQLite without redeploying containers.
+3. **Scope separation**
+   - Agent tokens can be limited to exact tasks (`scan`, `postings:write`, etc.) instead of broad admin access.
+4. **Auditability**
+   - Token-protected actions are logged with request IDs and audit event records for traceability.
+5. **Operational recovery**
+   - If DB token config is broken or all tokens are revoked, bootstrap env token preserves admin access.
+
+Operational guidance:
+- Use `RECOMMENDER_API_KEY` only as bootstrap/admin fallback.
+- Use DB-managed scoped tokens for normal human/agent automation.
+- Revoke old DB tokens after migration completes.
+- Prefer short-lived or purpose-specific scoped tokens for agents.
 
 ## Observability baseline
 
