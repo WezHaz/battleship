@@ -43,6 +43,8 @@ OperationBattleship is a Python microservices job-search platform scaffold using
   - `GET /job-sources`
   - `POST /job-sources/{source_id}/scan`
   - `POST /job-sources/scan`
+  - `POST /job-sources/scan/scheduled`
+  - `GET /job-sources/scan-history`
   - `POST /profiles`
   - `GET /profiles`
   - `GET /profiles/{profile_id}`
@@ -202,13 +204,23 @@ Register a source, then run source scans on demand or from cron.
 
 # Scan all enabled sources
 ./scripts/scan_sources.sh
+
+# Scheduled-style scan (always respects backoff)
+./scripts/scan_sources.sh http://localhost:8001 true scheduled
 ```
 
 When a source scan runs:
 - postings are normalized and upserted into SQLite
-- source health is tracked (`last_scan_at`, `last_status`, `last_error`)
+- source health is tracked (`last_scan_at`, `last_success_at`, `last_status`, `last_error`)
+- failures apply exponential backoff (`next_eligible_scan_at`, `consecutive_failures`)
 - recommend calls can use stored postings with `"postings":[]`
 - source scan results also report `possible_duplicates`
+
+Backoff + history endpoints:
+- `POST /job-sources/{source_id}/scan?respect_backoff=true` returns `status=skipped` if still in backoff
+- `POST /job-sources/scan` supports `enabled_only` and `respect_backoff`
+- `POST /job-sources/scan/scheduled` runs scheduled trigger mode with backoff enabled
+- `GET /job-sources/scan-history` supports `limit`, `source_id`, and `trigger` filters
 
 ## Recommendation personalization
 
@@ -256,6 +268,8 @@ Set `RECOMMENDER_API_KEY` to protect write endpoints:
 - `POST /job-sources`
 - `POST /job-sources/{source_id}/scan`
 - `POST /job-sources/scan`
+- `POST /job-sources/scan/scheduled`
+- `GET /job-sources/scan-history`
 - `POST /profiles`
 - `DELETE /profiles/{profile_id}`
 - `GET /audit-events`

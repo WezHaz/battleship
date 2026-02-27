@@ -284,29 +284,55 @@ class JobSource(BaseModel):
     created_at: str
     updated_at: str
     last_scan_at: str | None = None
+    last_success_at: str | None = None
     last_status: str | None = None
     last_error: str | None = None
+    next_eligible_scan_at: str | None = None
+    consecutive_failures: int = 0
     config: dict[str, Any]
 
 
 class JobSourceScanResult(BaseModel):
     source_id: str
     scanned_at: str
-    status: Literal["ok", "error"]
+    trigger: Literal["manual", "scheduled"]
+    status: Literal["ok", "error", "skipped"]
     fetched: int
     ingested: int
     possible_duplicates: int
+    attempt_number: int
+    backoff_seconds: int
+    next_eligible_scan_at: str | None = None
     error: str | None = None
 
 
 class JobSourceScanBatchResponse(BaseModel):
     scanned_at: str
+    trigger: Literal["manual", "scheduled"]
+    respect_backoff: bool
     requested_sources: int
     successful_sources: int
     failed_sources: int
+    skipped_sources: int
     total_ingested: int
     possible_duplicates: int
     results: list[JobSourceScanResult]
+
+
+class JobSourceScanHistoryItem(BaseModel):
+    history_id: int
+    source_id: str
+    scanned_at: str
+    trigger: Literal["manual", "scheduled"]
+    status: Literal["ok", "error", "skipped"]
+    fetched: int
+    ingested: int
+    possible_duplicates: int
+    attempt_number: int
+    backoff_seconds: int
+    next_eligible_scan_at: str | None = None
+    respect_backoff: bool
+    error: str | None = None
 
 
 class UpsertSummary(BaseModel):
@@ -481,8 +507,27 @@ class RecommenderRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_scan_at TEXT,
+                    last_success_at TEXT,
                     last_status TEXT,
-                    last_error TEXT
+                    last_error TEXT,
+                    next_eligible_scan_at TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS job_source_scan_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL,
+                    scanned_at TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    fetched INTEGER NOT NULL,
+                    ingested INTEGER NOT NULL,
+                    possible_duplicates INTEGER NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    backoff_seconds INTEGER NOT NULL,
+                    next_eligible_scan_at TEXT,
+                    respect_backoff INTEGER NOT NULL DEFAULT 0,
+                    error TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS user_profiles (
@@ -525,6 +570,7 @@ class RecommenderRepository:
                 """
             )
             self._ensure_job_postings_columns()
+            self._ensure_job_sources_columns()
             self._ensure_audit_events_columns()
             self._ensure_api_tokens_columns()
             self._connection.commit()
@@ -551,6 +597,21 @@ class RecommenderRepository:
                 continue
             self.connection.execute(
                 f"ALTER TABLE job_postings ADD COLUMN {column_name} {definition}"
+            )
+
+    def _ensure_job_sources_columns(self) -> None:
+        column_rows = self.connection.execute("PRAGMA table_info(job_sources)").fetchall()
+        existing = {row["name"] for row in column_rows}
+        required_definitions = {
+            "last_success_at": "TEXT",
+            "next_eligible_scan_at": "TEXT",
+            "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, definition in required_definitions.items():
+            if column_name in existing:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE job_sources ADD COLUMN {column_name} {definition}"
             )
 
     def _ensure_audit_events_columns(self) -> None:
@@ -816,8 +877,11 @@ class RecommenderRepository:
                     created_at,
                     updated_at,
                     last_scan_at,
+                    last_success_at,
                     last_status,
-                    last_error
+                    last_error,
+                    next_eligible_scan_at,
+                    consecutive_failures
                 FROM job_sources
                 WHERE source_id = ?
                 """,
@@ -841,8 +905,11 @@ class RecommenderRepository:
                         created_at,
                         updated_at,
                         last_scan_at,
+                        last_success_at,
                         last_status,
-                        last_error
+                        last_error,
+                        next_eligible_scan_at,
+                        consecutive_failures
                     FROM job_sources
                     WHERE enabled = 1
                     ORDER BY source_id
@@ -860,12 +927,53 @@ class RecommenderRepository:
                         created_at,
                         updated_at,
                         last_scan_at,
+                        last_success_at,
                         last_status,
-                        last_error
+                        last_error,
+                        next_eligible_scan_at,
+                        consecutive_failures
                     FROM job_sources
                     ORDER BY source_id
                     """
                 )
+            return [self._to_job_source(row) for row in cursor.fetchall()]
+
+    def list_scan_targets(
+        self,
+        *,
+        enabled_only: bool,
+        respect_backoff: bool,
+        now_iso: str,
+    ) -> list[JobSource]:
+        with self._lock:
+            query = """
+                SELECT
+                    source_id,
+                    name,
+                    source_type,
+                    config_json,
+                    enabled,
+                    created_at,
+                    updated_at,
+                    last_scan_at,
+                    last_success_at,
+                    last_status,
+                    last_error,
+                    next_eligible_scan_at,
+                    consecutive_failures
+                FROM job_sources
+            """
+            filters: list[str] = []
+            params: list[Any] = []
+            if enabled_only:
+                filters.append("enabled = 1")
+            if respect_backoff:
+                filters.append("(next_eligible_scan_at IS NULL OR next_eligible_scan_at <= ?)")
+                params.append(now_iso)
+            if filters:
+                query += " WHERE " + " AND ".join(filters)
+            query += " ORDER BY source_id"
+            cursor = self.connection.execute(query, tuple(params))
             return [self._to_job_source(row) for row in cursor.fetchall()]
 
     def upsert_user_profile(self, payload: UserProfileUpsertRequest) -> UserPreferenceProfile:
@@ -1233,28 +1341,199 @@ class RecommenderRepository:
             cursor = self.connection.execute(query, tuple(params))
             return [AuditEvent(**dict(row)) for row in cursor.fetchall()]
 
-    def update_job_source_scan_state(
+    def record_job_source_scan_result(
         self,
         source_id: str,
         *,
         scanned_at: str,
+        trigger: str,
         status: str,
+        fetched: int,
+        ingested: int,
+        possible_duplicates: int,
         error: str | None,
-    ) -> None:
+        respect_backoff: bool,
+    ) -> JobSourceScanResult:
         with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT
+                    consecutive_failures,
+                    next_eligible_scan_at,
+                    last_error
+                FROM job_sources
+                WHERE source_id = ?
+                """,
+                (source_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown source_id: {source_id}")
+
+            previous_failures = int(row["consecutive_failures"] or 0)
+            next_eligible_previous = row["next_eligible_scan_at"]
+            previous_last_error = row["last_error"]
+            attempt_number = previous_failures + 1
+            backoff_seconds = 0
+            next_eligible_scan_at: str | None = None
+            last_success_at: str | None = None
+            next_failure_count = previous_failures
+            last_error = error
+
+            if status == "ok":
+                attempt_number = 1
+                next_failure_count = 0
+                last_success_at = scanned_at
+                last_error = None
+            elif status == "error":
+                next_failure_count = previous_failures + 1
+                backoff_seconds = min(60 * (2 ** max(next_failure_count - 1, 0)), 3600)
+                next_eligible = datetime.fromisoformat(scanned_at) + timedelta(
+                    seconds=backoff_seconds
+                )
+                next_eligible_scan_at = next_eligible.isoformat()
+            elif status == "skipped":
+                attempt_number = previous_failures + 1
+                next_failure_count = previous_failures
+                next_eligible_scan_at = next_eligible_previous
+                last_error = previous_last_error
+                if next_eligible_scan_at:
+                    parsed_now = parse_iso_datetime(scanned_at)
+                    parsed_next = parse_iso_datetime(next_eligible_scan_at)
+                    if parsed_now and parsed_next:
+                        delta = parsed_next - parsed_now
+                        backoff_seconds = max(int(delta.total_seconds()), 0)
+
             self.connection.execute(
                 """
                 UPDATE job_sources
                 SET
                     last_scan_at = ?,
+                    last_success_at = COALESCE(?, last_success_at),
                     last_status = ?,
                     last_error = ?,
+                    next_eligible_scan_at = ?,
+                    consecutive_failures = ?,
                     updated_at = ?
                 WHERE source_id = ?
                 """,
-                (scanned_at, status, error, now_utc_iso(), source_id),
+                (
+                    scanned_at,
+                    last_success_at,
+                    status,
+                    last_error,
+                    next_eligible_scan_at,
+                    next_failure_count,
+                    now_utc_iso(),
+                    source_id,
+                ),
+            )
+
+            self.connection.execute(
+                """
+                INSERT INTO job_source_scan_history (
+                    source_id,
+                    scanned_at,
+                    trigger,
+                    status,
+                    fetched,
+                    ingested,
+                    possible_duplicates,
+                    attempt_number,
+                    backoff_seconds,
+                    next_eligible_scan_at,
+                    respect_backoff,
+                    error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    scanned_at,
+                    trigger,
+                    status,
+                    fetched,
+                    ingested,
+                    possible_duplicates,
+                    attempt_number,
+                    backoff_seconds,
+                    next_eligible_scan_at,
+                    int(respect_backoff),
+                    error,
+                ),
             )
             self.connection.commit()
+
+            return JobSourceScanResult(
+                source_id=source_id,
+                scanned_at=scanned_at,
+                trigger="scheduled" if trigger == "scheduled" else "manual",
+                status=status,  # type: ignore[arg-type]
+                fetched=fetched,
+                ingested=ingested,
+                possible_duplicates=possible_duplicates,
+                attempt_number=attempt_number,
+                backoff_seconds=backoff_seconds,
+                next_eligible_scan_at=next_eligible_scan_at,
+                error=error,
+            )
+
+    def list_job_source_scan_history(
+        self,
+        *,
+        limit: int,
+        source_id: str | None,
+        trigger: str | None,
+    ) -> list[JobSourceScanHistoryItem]:
+        with self._lock:
+            query = """
+                SELECT
+                    id AS history_id,
+                    source_id,
+                    scanned_at,
+                    trigger,
+                    status,
+                    fetched,
+                    ingested,
+                    possible_duplicates,
+                    attempt_number,
+                    backoff_seconds,
+                    next_eligible_scan_at,
+                    respect_backoff,
+                    error
+                FROM job_source_scan_history
+            """
+            params: list[Any] = []
+            filters: list[str] = []
+            if source_id:
+                filters.append("source_id = ?")
+                params.append(source_id)
+            if trigger:
+                filters.append("trigger = ?")
+                params.append(trigger)
+            if filters:
+                query += " WHERE " + " AND ".join(filters)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            cursor = self.connection.execute(query, tuple(params))
+            rows = cursor.fetchall()
+            return [
+                JobSourceScanHistoryItem(
+                    history_id=row["history_id"],
+                    source_id=row["source_id"],
+                    scanned_at=row["scanned_at"],
+                    trigger=row["trigger"],
+                    status=row["status"],
+                    fetched=row["fetched"],
+                    ingested=row["ingested"],
+                    possible_duplicates=row["possible_duplicates"],
+                    attempt_number=row["attempt_number"],
+                    backoff_seconds=row["backoff_seconds"],
+                    next_eligible_scan_at=row["next_eligible_scan_at"],
+                    respect_backoff=bool(row["respect_backoff"]),
+                    error=row["error"],
+                )
+                for row in rows
+            ]
 
     def _to_job_source(self, row: sqlite3.Row) -> JobSource:
         config: dict[str, Any] = json.loads(row["config_json"])
@@ -1266,8 +1545,11 @@ class RecommenderRepository:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             last_scan_at=row["last_scan_at"],
+            last_success_at=row["last_success_at"],
             last_status=row["last_status"],
             last_error=row["last_error"],
+            next_eligible_scan_at=row["next_eligible_scan_at"],
+            consecutive_failures=int(row["consecutive_failures"] or 0),
             config=config,
         )
 
@@ -1514,43 +1796,57 @@ def load_source_payload(source: JobSource) -> Any:
         return json.loads(body)
 
 
-def scan_source(repository: RecommenderRepository, source: JobSource) -> JobSourceScanResult:
+def scan_source(
+    repository: RecommenderRepository,
+    source: JobSource,
+    *,
+    trigger: Literal["manual", "scheduled"],
+    respect_backoff: bool,
+) -> JobSourceScanResult:
     scanned_at = now_utc_iso()
+    if respect_backoff and source.next_eligible_scan_at:
+        parsed_now = parse_iso_datetime(scanned_at)
+        parsed_next = parse_iso_datetime(source.next_eligible_scan_at)
+        if parsed_now and parsed_next and parsed_next > parsed_now:
+            return repository.record_job_source_scan_result(
+                source.source_id,
+                scanned_at=scanned_at,
+                trigger=trigger,
+                status="skipped",
+                fetched=0,
+                ingested=0,
+                possible_duplicates=0,
+                error=None,
+                respect_backoff=respect_backoff,
+            )
+
     try:
         payload = load_source_payload(source)
         postings = to_job_postings_from_payload(source.source_id, payload, scanned_at=scanned_at)
         summary = repository.upsert_postings(postings, return_stats=True)
-        result = JobSourceScanResult(
-            source_id=source.source_id,
+        return repository.record_job_source_scan_result(
+            source.source_id,
             scanned_at=scanned_at,
+            trigger=trigger,
             status="ok",
             fetched=len(postings),
             ingested=summary.updated,
             possible_duplicates=summary.possible_duplicates,
-        )
-        repository.update_job_source_scan_state(
-            source.source_id,
-            scanned_at=scanned_at,
-            status="ok",
             error=None,
+            respect_backoff=respect_backoff,
         )
-        return result
     except Exception as exc:
         error_text = str(exc)
-        repository.update_job_source_scan_state(
+        return repository.record_job_source_scan_result(
             source.source_id,
             scanned_at=scanned_at,
-            status="error",
-            error=error_text,
-        )
-        return JobSourceScanResult(
-            source_id=source.source_id,
-            scanned_at=scanned_at,
+            trigger=trigger,
             status="error",
             fetched=0,
             ingested=0,
             possible_duplicates=0,
             error=error_text,
+            respect_backoff=respect_backoff,
         )
 
 
@@ -1824,6 +2120,7 @@ def create_app(
         source_id: str,
         request: Request,
         response: Response,
+        respect_backoff: bool = Query(default=False),
     ) -> JobSourceScanResult:
         auth_subject = await require_scope(
             request,
@@ -1843,7 +2140,13 @@ def create_app(
             response.headers["x-audit-event-id"] = str(event_id)
             raise HTTPException(status_code=404, detail="Unknown source_id")
 
-        result = await run_in_threadpool(scan_source, request.app.state.repository, source)
+        result = await run_in_threadpool(
+            scan_source,
+            request.app.state.repository,
+            source,
+            trigger="manual",
+            respect_backoff=respect_backoff,
+        )
         if result.status == "error":
             event_id = await write_audit_event(
                 request,
@@ -1864,7 +2167,7 @@ def create_app(
             scope="scan",
             status="ok",
             message=(
-                f"source_id={source_id}; ingested={result.ingested}; "
+                f"source_id={source_id}; status={result.status}; ingested={result.ingested}; "
                 f"possible_duplicates={result.possible_duplicates}"
             ),
             auth_subject=auth_subject,
@@ -1877,6 +2180,7 @@ def create_app(
         request: Request,
         response: Response,
         enabled_only: bool = Query(default=True),
+        respect_backoff: bool = Query(default=False),
     ) -> JobSourceScanBatchResponse:
         auth_subject = await require_scope(
             request,
@@ -1884,19 +2188,30 @@ def create_app(
             scope="scan",
         )
         sources = await run_in_threadpool(
-            request.app.state.repository.list_job_sources,
-            enabled_only,
+            request.app.state.repository.list_scan_targets,
+            enabled_only=enabled_only,
+            respect_backoff=False,
+            now_iso=now_utc_iso(),
         )
         results: list[JobSourceScanResult] = []
         for source in sources:
-            result = await run_in_threadpool(scan_source, request.app.state.repository, source)
+            result = await run_in_threadpool(
+                scan_source,
+                request.app.state.repository,
+                source,
+                trigger="manual",
+                respect_backoff=respect_backoff,
+            )
             results.append(result)
 
         batch = JobSourceScanBatchResponse(
             scanned_at=now_utc_iso(),
+            trigger="manual",
+            respect_backoff=respect_backoff,
             requested_sources=len(sources),
             successful_sources=sum(1 for result in results if result.status == "ok"),
             failed_sources=sum(1 for result in results if result.status == "error"),
+            skipped_sources=sum(1 for result in results if result.status == "skipped"),
             total_ingested=sum(result.ingested for result in results),
             possible_duplicates=sum(result.possible_duplicates for result in results),
             results=results,
@@ -1908,12 +2223,101 @@ def create_app(
             status="ok" if batch.failed_sources == 0 else "partial",
             message=(
                 f"requested={batch.requested_sources}; success={batch.successful_sources}; "
-                f"failed={batch.failed_sources}; ingested={batch.total_ingested}"
+                f"failed={batch.failed_sources}; skipped={batch.skipped_sources}; "
+                f"ingested={batch.total_ingested}"
             ),
             auth_subject=auth_subject,
         )
         response.headers["x-audit-event-id"] = str(event_id)
         return batch
+
+    @app.post("/job-sources/scan/scheduled", response_model=JobSourceScanBatchResponse)
+    async def scheduled_scan_job_sources(
+        request: Request,
+        response: Response,
+        enabled_only: bool = Query(default=True),
+    ) -> JobSourceScanBatchResponse:
+        auth_subject = await require_scope(
+            request,
+            action="job_source_scan_scheduled",
+            scope="scan",
+        )
+        sources = await run_in_threadpool(
+            request.app.state.repository.list_scan_targets,
+            enabled_only=enabled_only,
+            respect_backoff=False,
+            now_iso=now_utc_iso(),
+        )
+        results: list[JobSourceScanResult] = []
+        for source in sources:
+            result = await run_in_threadpool(
+                scan_source,
+                request.app.state.repository,
+                source,
+                trigger="scheduled",
+                respect_backoff=True,
+            )
+            results.append(result)
+
+        batch = JobSourceScanBatchResponse(
+            scanned_at=now_utc_iso(),
+            trigger="scheduled",
+            respect_backoff=True,
+            requested_sources=len(sources),
+            successful_sources=sum(1 for result in results if result.status == "ok"),
+            failed_sources=sum(1 for result in results if result.status == "error"),
+            skipped_sources=sum(1 for result in results if result.status == "skipped"),
+            total_ingested=sum(result.ingested for result in results),
+            possible_duplicates=sum(result.possible_duplicates for result in results),
+            results=results,
+        )
+        event_id = await write_audit_event(
+            request,
+            action="job_source_scan_scheduled",
+            scope="scan",
+            status="ok" if batch.failed_sources == 0 else "partial",
+            message=(
+                f"requested={batch.requested_sources}; success={batch.successful_sources}; "
+                f"failed={batch.failed_sources}; skipped={batch.skipped_sources}; "
+                f"ingested={batch.total_ingested}"
+            ),
+            auth_subject=auth_subject,
+        )
+        response.headers["x-audit-event-id"] = str(event_id)
+        return batch
+
+    @app.get("/job-sources/scan-history", response_model=list[JobSourceScanHistoryItem])
+    async def job_source_scan_history(
+        request: Request,
+        response: Response,
+        limit: int = Query(default=100, ge=1, le=500),
+        source_id: str | None = None,
+        trigger: Literal["manual", "scheduled"] | None = None,
+    ) -> list[JobSourceScanHistoryItem]:
+        auth_subject = await require_scope(
+            request,
+            action="job_source_scan_history",
+            scope="scan",
+        )
+        history = await run_in_threadpool(
+            request.app.state.repository.list_job_source_scan_history,
+            limit=limit,
+            source_id=source_id,
+            trigger=trigger,
+        )
+        event_id = await write_audit_event(
+            request,
+            action="job_source_scan_history",
+            scope="scan",
+            status="ok",
+            message=(
+                f"returned={len(history)}; source_id={source_id or '*'}; "
+                f"trigger={trigger or '*'}"
+            ),
+            auth_subject=auth_subject,
+        )
+        response.headers["x-audit-event-id"] = str(event_id)
+        return history
 
     @app.post("/profiles", response_model=UserPreferenceProfile)
     async def upsert_profile(

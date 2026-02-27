@@ -199,3 +199,93 @@ def test_write_endpoints_require_api_key_when_configured(tmp_path: Path) -> None
         )
         assert allowed.status_code == 200
         assert allowed.json() == {"updated": 1}
+
+
+def test_scan_backoff_skip_and_history(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingResponse:
+        def __enter__(self) -> FailingResponse:
+            return self
+
+        def __exit__(self, *_: object) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            raise RuntimeError("upstream unavailable")
+
+    def failing_urlopen(url: str, timeout: int = 15) -> FailingResponse:
+        del timeout
+        assert url == "https://example.com/failing.json"
+        return FailingResponse()
+
+    monkeypatch.setattr("recommender.main.urllib_request.urlopen", failing_urlopen)
+
+    source_response = client.post(
+        "/job-sources",
+        json={
+            "source_id": "failing_demo",
+            "name": "Failing Demo",
+            "source_type": "json_url",
+            "url": "https://example.com/failing.json",
+            "enabled": True,
+        },
+    )
+    assert source_response.status_code == 200
+
+    first_scan = client.post("/job-sources/failing_demo/scan")
+    assert first_scan.status_code == 502
+
+    skipped_scan = client.post("/job-sources/failing_demo/scan?respect_backoff=true")
+    assert skipped_scan.status_code == 200
+    skipped_body = skipped_scan.json()
+    assert skipped_body["status"] == "skipped"
+    assert skipped_body["backoff_seconds"] > 0
+    assert skipped_body["attempt_number"] >= 2
+
+    sources_response = client.get("/job-sources")
+    assert sources_response.status_code == 200
+    sources = {item["source_id"]: item for item in sources_response.json()}
+    failing_source = sources["failing_demo"]
+    assert failing_source["last_status"] == "skipped"
+    assert failing_source["consecutive_failures"] == 1
+    assert failing_source["next_eligible_scan_at"]
+    assert failing_source["last_error"] == "upstream unavailable"
+
+    history_response = client.get("/job-sources/scan-history?source_id=failing_demo")
+    assert history_response.status_code == 200
+    history = history_response.json()
+    assert len(history) >= 2
+    assert history[0]["status"] == "skipped"
+    assert history[0]["trigger"] == "manual"
+    assert history[1]["status"] == "error"
+
+
+def test_scheduled_scan_endpoint_uses_scheduled_trigger(client: TestClient) -> None:
+    source_response = client.post(
+        "/job-sources",
+        json={
+            "source_id": "scheduled_demo",
+            "name": "Scheduled Demo",
+            "source_type": "inline_json",
+            "postings": [{"title": "Data Engineer", "description": "Build data products"}],
+            "enabled": True,
+        },
+    )
+    assert source_response.status_code == 200
+
+    scan_response = client.post("/job-sources/scan/scheduled")
+    assert scan_response.status_code == 200
+    body = scan_response.json()
+    assert body["trigger"] == "scheduled"
+    assert body["respect_backoff"] is True
+    assert body["requested_sources"] == 1
+    assert body["successful_sources"] == 1
+    assert body["results"][0]["trigger"] == "scheduled"
+
+    history_response = client.get("/job-sources/scan-history?trigger=scheduled")
+    assert history_response.status_code == 200
+    history = history_response.json()
+    assert len(history) >= 1
+    assert history[0]["trigger"] == "scheduled"

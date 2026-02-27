@@ -101,3 +101,50 @@ def test_audit_events_capture_status_and_action(client: TestClient) -> None:
     assert "ok" in statuses
     assert "job_source_scan_all" in actions
     assert "job_source_upsert" in actions
+
+
+def test_scan_scheduled_and_history_require_scan_scope(client: TestClient) -> None:
+    create_source = client.post(
+        "/job-sources",
+        headers={"x-api-key": "token-admin"},
+        json={
+            "source_id": "scheduled_auth_demo",
+            "name": "Scheduled Auth Demo",
+            "source_type": "inline_json",
+            "postings": [{"title": "Backend Engineer", "description": "Build Python APIs"}],
+            "enabled": True,
+        },
+    )
+    assert create_source.status_code == 200
+
+    scheduled_missing = client.post("/job-sources/scan/scheduled")
+    assert scheduled_missing.status_code == 401
+
+    scheduled_forbidden = client.post(
+        "/job-sources/scan/scheduled",
+        headers={"x-api-key": "token-postings"},
+    )
+    assert scheduled_forbidden.status_code == 403
+
+    scheduled_ok = client.post(
+        "/job-sources/scan/scheduled",
+        headers={"x-api-key": "token-scan"},
+    )
+    assert scheduled_ok.status_code == 200
+    assert scheduled_ok.headers.get("x-audit-event-id")
+
+    history_missing = client.get("/job-sources/scan-history")
+    assert history_missing.status_code == 401
+
+    history_forbidden = client.get(
+        "/job-sources/scan-history",
+        headers={"x-api-key": "token-postings"},
+    )
+    assert history_forbidden.status_code == 403
+
+    history_ok = client.get(
+        "/job-sources/scan-history",
+        headers={"x-api-key": "token-scan"},
+    )
+    assert history_ok.status_code == 200
+    assert history_ok.headers.get("x-audit-event-id")
