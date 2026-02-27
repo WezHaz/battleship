@@ -1,0 +1,19 @@
+{
+  "postings": [
+    {
+      "id": "job-1",
+      "title": "Backend Engineer",
+      "description": "Build Python APIs and backend services"
+    },
+    {
+      "id": "job-2",
+      "title": "Platform Engineer",
+      "description": "Own CI pipelines and developer tooling"
+    },
+    {
+      "id": "job-3",
+      "title": "Data Scientist",
+      "description": "Train and deploy machine learning models"
+    }
+  ]
+}

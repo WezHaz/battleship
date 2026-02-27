@@ -149,6 +149,12 @@ curl -X POST http://localhost:8001/recommend \
 curl http://localhost:8001/recommendations/history
 ```
 
+Use the helper scanner script to ingest posting files quickly:
+
+```bash
+./scripts/scan_postings.sh ./scripts/example_postings.json
+```
+
 ## Terraform IaC
 
 Terraform templates are under `infra/` with reusable modules and `dev`/`prod` environments.
