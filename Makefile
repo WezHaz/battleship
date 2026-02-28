@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 .PHONY: init lock sync lint test test-smoke test-unit test-integration test-bdd dev down \
 	 run-recommender run-frontend run-emailer \
-	 register-source scan-sources \
+	 register-source scan-sources push-remotes \
 	 tf-init-dev tf-plan-dev tf-apply-dev \
 	 tf-init-prod tf-plan-prod tf-apply-prod
 
@@ -53,6 +53,9 @@ register-source:
 
 scan-sources:
 	./scripts/scan_sources.sh
+
+push-remotes:
+	./scripts/push_remotes.sh
 
 tf-init-dev:
 	terraform -chdir=infra/environments/dev init

@@ -375,6 +375,22 @@ Modules provision baseline AWS components:
 
 - `ci.yml`: sync deps, lint, test, and build Docker images
 - `release.yml`: build/push images and apply Terraform to selected environment
+- `.gitea/workflows/ci.yml`: primary CI workflow for Gitea-based validation
+
+## Repository and deployment strategy
+
+- Gitea is the CI/CD source of truth for this project.
+- GitHub remains a parallel mirror remote.
+- Local remote names:
+  - `gitea` -> primary deployment/automation remote
+  - `origin` -> GitHub mirror
+- Use `./scripts/push_remotes.sh` to keep both remotes updated in parallel.
+- First hosted target remains homelab-only on `firefox`.
+- Public-cloud fallback should reuse the same single-node container pattern before any move to managed cloud services.
+
+Planning docs:
+- `docs/operations/deployment_strategy.md`
+- `docs/operations/firefox_homelab_deployment_plan.md`
 
 ## Possible updates backlog
 
